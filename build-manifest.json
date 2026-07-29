@@ -4,23 +4,36 @@
       "bytes": 512,
       "sha256": "b595e72115d92800c8c307e815f2085396c8b750188321b8b88356129c631c7e"
     },
+    "experiment.json": {
+      "bytes": 1952,
+      "sha256": "f673bcc977ac95331574a3da37554db53db39ec3b998e555975b4bf950f7605b"
+    },
     "floppy.img": {
       "bytes": 1474560,
-      "sha256": "8d9afe7b04f345b648b9066bb082b735a193207464a289e27292146521c81684"
+      "sha256": "f302d9c8ce8d281ff73c1963ffad4510b90df085fccbc7db5a732cee9ff3846b"
     },
     "kernel.bin": {
-      "bytes": 1330,
-      "sha256": "d841e60328592d82835d3268f9bb99e133817998694b724b6eb01fc35cd8df27"
+      "bytes": 1535,
+      "sha256": "df60f68b46fd017e559a959389f48454d1542192fba9c91155b473d937390c59"
     },
     "os.iso": {
-      "bytes": 1523712,
-      "sha256": "56560ddc7bd7e22214fcc911e66e45625e6239c2b5ee17ec2f763815ba5f9e51"
+      "bytes": 1525760,
+      "sha256": "73f3ef02430871f273900766f7ae832b9baf384d9887aedeff1dab93444a347d"
     }
   },
-  "format_version": 1,
+  "config_id": 61009,
+  "config_id_hex": "0xEE51",
+  "config_sha256": "51ee27c971677ec620c314428d94cb8449623e52e793b7f672a0cd4dcb491ed3",
+  "format_version": 2,
   "kernel_load_address": "0x1000",
   "kernel_sectors": 3,
+  "model_abi_version": 3,
   "project": "Envo Agent OS",
   "seed": 44257,
-  "version": "1.1.0"
+  "telemetry": {
+    "interval_ticks": 1,
+    "record_bytes": 32,
+    "version": 2
+  },
+  "version": "1.2.0"
 }

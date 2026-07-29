@@ -109,7 +109,10 @@ def test_build_artifacts_is_reproducible_and_internally_consistent() -> None:
         (len(kernel) + SECTOR_SIZE - 1) // SECTOR_SIZE
     )
     assert floppy == make_floppy_image(boot, kernel)
-    assert _artifact(first, "iso") == make_iso_image(floppy)
+    assert _artifact(first, "iso") == make_iso_image(
+        floppy,
+        first.experiment,
+    )
 
 
 def test_cli_check_confirms_tracked_artifact_parity() -> None:

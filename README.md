@@ -16,7 +16,8 @@ model.
 - Display: VGA Mode 13h, 320 x 200 pixels
 - Recommended host: QEMU on Windows, Linux, or macOS
 - Firmware support: legacy BIOS only; UEFI is future work
-- Maturity: v1 lineage, but still pre-1.0 in compatibility and support maturity
+- Experiment interface: release 1.2.0, model ABI 3, `EV` telemetry version 2
+- Maturity: experimental; compatibility and scientific validation are evolving
 
 Run the image in an emulator. Booting experimental media on physical hardware is
 unsupported and may hang or behave differently across firmware implementations.
@@ -32,6 +33,12 @@ python create_iso.py --output-dir build --seed 44257 --check
 qemu-system-i386 -cdrom build/os.iso
 ```
 
+For a headless, machine-checked experiment:
+
+```text
+python run_experiment.py build/os.iso --experiment build/experiment.json --output build/telemetry.bin --frames 2
+```
+
 To boot the floppy image instead:
 
 ```text
@@ -41,15 +48,22 @@ qemu-system-i386 -fda build/floppy.img
 The canonical command-line form is:
 
 ```text
-python create_iso.py [--output-dir DIR] [--seed N] [--check]
+python create_iso.py [--output-dir DIR] [--config FILE] [--seed N]
+                     [--telemetry-interval N] [--check]
 ```
 
 - `--output-dir DIR` keeps generated files together. The default is the
   repository directory containing `create_iso.py`.
 - `--seed N` selects the deterministic simulation seed. Reusing a seed with the
-  same source revision and build settings is intended to reproduce the same
-  initial world and artifacts. Decimal and `0x`-prefixed hexadecimal values from
-  1 through 65535 are accepted; the default is `0xACE1`.
+  same model configuration is intended to reproduce the same initial world and
+  artifacts. Decimal and `0x`-prefixed hexadecimal values from 1 through 65535
+  are accepted; the default is `0xACE1`.
+- `--config FILE` rebuilds a complete experiment from a generated
+  `experiment.json`. `--seed` and `--telemetry-interval` can explicitly override
+  those two fields.
+- `--telemetry-interval N` emits one observation every N ticks. N must be a
+  power of two from 1 through 32768; the default is 1. It changes the
+  observation schedule and experiment identity, not the modeled trajectory.
 - `--check` is a read-only parity mode. It rebuilds the expected artifact set in
   memory and verifies that the selected output directory already contains
   matching files. Run the build command first; missing, stale, or mixed
@@ -71,40 +85,74 @@ Keyboard handling is BIOS-based and intentionally minimal.
 | `boot.bin` | 512-byte BIOS boot sector used by the media images |
 | `kernel.bin` | Generated 16-bit simulation kernel |
 | `floppy.img` | Bootable 1.44 MB floppy image |
-| `os.iso` | El Torito bootable CD-ROM image containing the floppy image |
-| `build-manifest.json` | Version, seed, sizes, and SHA-256 digests for the build |
+| `os.iso` | El Torito CD-ROM image containing the floppy and experiment identity |
+| `experiment.json` | Canonical model parameters, memory layout, telemetry ABI, and configuration ID |
+| `build-manifest.json` | Version, configuration identity, sizes, and SHA-256 artifact digests |
 
 Generated artifacts should be treated as a set. The manifest makes it possible
 to detect stale or mixed binaries rather than assuming checked-in media matches
-the current source.
+the current source. The same experiment document is available inside `os.iso`
+as `/EXPERIMENT.JSON;1`.
 
-## Debug telemetry
+## Reproducible experiments
 
-The kernel exposes compact binary telemetry through x86 debug port `0xE9`.
-QEMU can capture it without adding a serial driver to the guest:
+Every build hashes the canonical model parameters, runtime layout, and telemetry
+descriptor into a full SHA-256 configuration identity and a compact 16-bit
+`config_id`. The exact experiment document is emitted beside the images and
+embedded in the ISO. The kernel includes that ID in every telemetry record so
+routine configuration mismatches are detected before analysis. The full hash
+remains authoritative: the short ID is only the little-endian interpretation of
+the digest's first two bytes and can collide. Require equal full hashes and
+artifact provenance before comparing experiments, then use the short ID to
+detect an accidentally mismatched trace.
+
+The easiest capture path boots QEMU without a display, waits for checksummed
+frames, verifies their configuration ID, and prints a JSON summary:
 
 ```text
-qemu-system-i386 -cdrom build/os.iso -debugcon file:build/telemetry.bin -global isa-debugcon.iobase=0xe9
+python run_experiment.py build/os.iso --frames 10 --timeout 60 --output build/telemetry.bin --json-out build/summary.json
 ```
 
-The bootloader and kernel emit the ASCII stage markers `B` and `K`. Each
-completed frame then emits four bytes:
+Existing traces can be inspected or compared independently:
 
 ```text
-0x46 births-low-byte kills-low-byte 0x0A
+python envo_telemetry.py build/telemetry.bin --strict --experiment build/experiment.json
+python envo_telemetry.py build/telemetry.bin --format jsonl
 ```
 
-`0x46` is ASCII `F`; the two counter fields are raw bytes, not decimal text.
-The telemetry schema is experimental. It is intended for deterministic smoke
-tests and host-side model analysis, not as a stable external API.
+The dependency-free reference model mirrors the guest's instruction order and
+emits the same wire records without booting an emulator:
+
+```text
+python envo_reference.py --config build/experiment.json --ticks 10
+```
+
+CI differentially compares live floppy and ISO frames against this reference,
+in addition to checking parity between both boot paths.
+
+The reference is a verification oracle for the current mechanics, not an
+independently validated ecological model. Multi-seed statistical validation and
+MAP-Elites experiments remain roadmap work.
+
+Version 2 frames contain the tick and PRNG state, lineage replacements by
+cause, prey energy and sensing sums, the complete speed histogram, maximum
+generation, and a checksum of canonical guest state. Framing, checksums, and
+stream resynchronization, host comparison, identity rules, and limitations are
+specified in [TELEMETRY.md](TELEMETRY.md). The schema remains experimental
+rather than a stable external API.
 
 ## Repository map
 
 | Path | Description |
 | --- | --- |
 | `create_iso.py` | Canonical assembler, kernel generator, media builder, CLI, and checks |
+| `envo_config.py` | Validated model configuration, memory layout, and experiment identity |
+| `envo_reference.py` | Exact host-side mirror for deterministic differential testing |
+| `envo_telemetry.py` | Streaming frame parser, trace comparison, summaries, and CLI |
+| `run_experiment.py` | Headless QEMU runner with frame and configuration validation |
 | `boot.asm` | Readable NASM reference for the Python-generated stage-1 loader |
 | `MODEL.md` | ODD-style model description, assumptions, and research roadmap |
+| `TELEMETRY.md` | Version 2 binary telemetry protocol |
 | `SECURITY.md` | Supported versions, safe-use guidance, and reporting process |
 | `boot.bin`, `floppy.img`, `os.iso` | Convenience artifacts; rebuild and verify before relying on them |
 
@@ -127,12 +175,29 @@ future work. See [MODEL.md](MODEL.md) for the exact rules and roadmap.
 - Fixed 320 x 200 indexed-color display
 - Small, fixed-capacity populations and O(n^2) neighborhood scans
 - Educational model rather than a calibrated ecological simulation
-- Emulator-oriented debug output and timing
+- Emulator-oriented timing and an experimental telemetry ABI with wrapping
+  16-bit counters
 
 ## Research and standards
 
 The roadmap is grounded in primary research and current platform specifications:
 
+- Grimm et al.,
+  [Using the ODD protocol and NetLogo to replicate agent-based models
+  (Ecological Modelling
+  2025)](https://doi.org/10.1016/j.ecolmodel.2024.110967)
+- Fachada et al.,
+  [Can large language models implement agent-based models? An ODD-based
+  replication study (Ecological Modelling
+  2026)](https://doi.org/10.1016/j.ecolmodel.2026.111624)
+- Bagic et al.,
+  [AEGIS: Individual-based modeling of life history evolution
+  (PLOS Computational Biology
+  2026)](https://doi.org/10.1371/journal.pcbi.1014109)
+- Moreno, Rodriguez-Papa, and Dolson,
+  [Ecology, Spatial Structure, and Selection Pressure Induce Strong Signatures
+  in Phylogenetic Structure (Artificial Life
+  2025)](https://doi.org/10.1162/artl_a_00470)
 - Faldor and Cully,
   [Toward Artificial Open-Ended Evolution within Lenia using Quality-Diversity
   (ALIFE 2024)](https://doi.org/10.1162/isal_a_00827)
@@ -149,8 +214,10 @@ The roadmap is grounded in primary research and current platform specifications:
 - [QEMU deterministic record/replay](https://qemu.readthedocs.io/en/master/devel/replay.html)
 - [UEFI Specification 2.11](https://uefi.org/specifications)
 
-The papers motivate future experiments; they do not imply that Envo Agent OS
-reproduces their results.
+The replication papers motivate the implemented description and observation
+surfaces. The life-history, phylogeny, diversity, and quality-diversity papers
+motivate future experiments. None implies that Envo Agent OS reproduces their
+models or results.
 
 ## License and conduct
 

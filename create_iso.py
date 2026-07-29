@@ -11,26 +11,43 @@ All checked-in binary artifacts are produced from this module.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
 import struct
 from typing import Iterable
 
+from envo_config import (
+    AGENT_RECORD_BYTES,
+    DATA_BASE,
+    DEFAULT_SEED,
+    MODEL_ABI_VERSION,
+    TELEMETRY_FRAME_TYPE,
+    TELEMETRY_MAGIC,
+    TELEMETRY_PAYLOAD_BYTES,
+    TELEMETRY_RECORD_BYTES,
+    TELEMETRY_VERSION,
+    ModelConfig,
+    RuntimeLayout,
+    build_experiment_document,
+    configuration_id,
+    configuration_sha256,
+    load_model_config,
+)
 
-VERSION = "1.1.0"
+
+VERSION = "1.2.0"
 SECTOR_SIZE = 512
 ISO_SECTOR_SIZE = 2048
 FLOPPY_SIZE = 1_474_560
 KERNEL_LOAD_ADDR = 0x1000
 MAX_KERNEL_SECTORS = 17  # sectors 2..18 on the first 1.44 MB floppy track
-DEFAULT_SEED = 0xACE1
-DATA_BASE = 0x9000
-NUM_PREY = 30
-NUM_PRED = 4
-NUM_FOOD = 50
-ENT_SIZE = 12
+DEFAULT_MODEL_CONFIG = ModelConfig()
+NUM_PREY = DEFAULT_MODEL_CONFIG.prey_count
+NUM_PRED = DEFAULT_MODEL_CONFIG.predator_count
+NUM_FOOD = DEFAULT_MODEL_CONFIG.food_count
+ENT_SIZE = AGENT_RECORD_BYTES
 
 
 class BuildError(RuntimeError):
@@ -54,6 +71,7 @@ class BuildArtifacts:
     floppy: bytes
     iso: bytes
     manifest: bytes
+    experiment: bytes = b""
 
 # --- MINI ASSEMBLER ---
 class ASM:
@@ -176,6 +194,7 @@ class ASM:
     def stosb(self): self.db(0xAA)
     def stosw(self): self.db(0xAB)
     def rep_stosb(self): self.db(0xF3); self.db(0xAA)
+    def rep_stosw(self): self.db(0xF3); self.db(0xAB)
 
     # IO
     def out_dx_al(self): self.db(0xEE)
@@ -267,9 +286,17 @@ def build_bootloader(kernel_sectors: int = 1) -> bytes:
     return assemble_bootloader(kernel_sectors).code
 
 
-def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
-    if not 1 <= seed <= 0xFFFF:
-        raise BuildError("Seed must be in the range 1..65535")
+def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
+    """Assemble a kernel for one validated model experiment."""
+
+    layout = RuntimeLayout.from_config(config)
+    seed = config.seed
+    NUM_PREY = config.prey_count
+    NUM_PRED = config.predator_count
+    NUM_FOOD = config.food_count
+    ENT_SIZE = layout.agent_record_bytes
+    prey_base = layout.prey_base
+    predator_base = layout.predator_base
 
     asm = ASM(org=0x1000)
 
@@ -281,7 +308,8 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     VGA_SEG = 0xA000
 
     # Entity: X, Y, energy, speed, sense, generation (six 16-bit words).
-    # Scratch words below DATA_BASE: PRNG, tick, births, kills, target, min distance.
+    # Scratch words below DATA_BASE: PRNG, tick, replacements, captures,
+    # target, min distance, starvations, and successful-forager turnovers.
 
     asm.label('start')
     asm.cli()
@@ -293,7 +321,7 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     # Reproducible runtime state.
     asm.mov_bx(DATA_BASE - 2); asm.mov_ax(seed); asm.db(b"\x89\x07")
     asm.xor_ax_ax()
-    for offset in (4, 6, 8, 10, 12):
+    for offset in (4, 6, 8, 10, 12, 14, 16):
         asm.mov_bx(DATA_BASE - offset); asm.db(b"\x89\x07")
 
     # Reset ES to 0 for data operations
@@ -312,7 +340,7 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
 
     # Palette Shifting (Simulate Day/Night)
     # Check if Time bit 8 is set (Cycle speed)
-    asm.db(0xA9); asm.dw(0x0100) # TEST AX, 0x100
+    asm.db(0xA9); asm.dw(config.day_night_mask)
     asm.je('is_day')
     # Night: Darken Palette (Simple hack: Use different BG color?)
     # Real palette shifting is complex. Let's just set a flag in DX.
@@ -341,9 +369,9 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.label('bg_night'); asm.mov_ax(0x1010)
     asm.label('bg_draw'); asm.db(0xF3); asm.db(0xAB)
 
-    # Draw Water (Bottom 30 pixels)
-    asm.mov_di(320 * 170)
-    asm.mov_cx(320 * 30 // 2)
+    # Draw the configured water band.
+    asm.mov_di(320 * config.waterline)
+    asm.mov_cx(320 * (200 - config.waterline) // 2)
     asm.mov_ax(0x3333) # Water Color
     asm.db(0xF3); asm.db(0xAB)
 
@@ -351,7 +379,11 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.cmp_dx(1); asm.jne('skip_fireflies')
     asm.mov_cx(20) # 20 Fireflies
     asm.label('firefly_loop')
-    asm.call('rand'); asm.and_ax(0x7FFF); asm.mov_di(0); asm.db(b"\x89\xC7")
+    # Cosmetic rendering must not consume the model PRNG. Derive a stable
+    # upper-screen position from the tick and loop index instead.
+    asm.db(b"\x89\xCF\xC1\xE7\x0A")  # DI=CX; DI<<=10
+    asm.mov_bx(DATA_BASE - 4); asm.db(b"\x03\x3F")  # ADD DI,[BX]
+    asm.db(b"\x81\xE7"); asm.dw(0x7FFF)
     asm.mov_ax(0x2C2C); asm.stosb()  # Yellow pixel in the upper half
     asm.label('ff_next')
     asm.dec_cx(); asm.jcxz('skip_fireflies'); asm.jmp('firefly_loop')
@@ -368,21 +400,99 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     # Food
     asm.mov_si(DATA_BASE); asm.mov_cx(NUM_FOOD); asm.call('update_food')
     # Prey
-    asm.mov_si(DATA_BASE + (NUM_FOOD * 6)); asm.mov_cx(NUM_PREY); asm.call('update_prey')
+    asm.mov_si(prey_base); asm.mov_cx(NUM_PREY); asm.call('update_prey')
     # Pred
-    asm.mov_si(DATA_BASE + (NUM_FOOD * 6) + (NUM_PREY * ENT_SIZE)); asm.mov_cx(NUM_PRED); asm.call('update_pred')
+    asm.mov_si(predator_base); asm.mov_cx(NUM_PRED); asm.call('update_pred')
 
-    # Machine-readable frame telemetry on the Bochs/QEMU debug port:
-    # "F", births-low-byte, kills-low-byte, newline.
-    asm.mov_dx(0x00E9); asm.mov_al(ord('F')); asm.out_dx_al()
-    asm.mov_bx(DATA_BASE - 6); asm.db(b"\x8B\x07"); asm.out_dx_al()
-    asm.mov_bx(DATA_BASE - 8); asm.db(b"\x8B\x07"); asm.out_dx_al()
-    asm.mov_al(0x0A); asm.out_dx_al()
+    # Emit the versioned experiment record at the configured power-of-two
+    # interval. Telemetry is observational: it never advances the PRNG.
+    asm.mov_bx(DATA_BASE - 4); asm.db(b"\x8B\x07")
+    asm.db(b"\xA9"); asm.dw(config.telemetry_interval - 1)
+    asm.jne('telemetry_done')
+    asm.call('emit_telemetry')
+    asm.label('telemetry_done')
 
     asm.call('delay')
     asm.jmp('main_loop')
 
     # --- FUNCTIONS ---
+
+    # Fixed 32-byte experiment record:
+    # EV, version, type, payload length, nine words, speed histogram,
+    # max generation, state checksum, and an additive checksum byte.
+    asm.label('emit_telemetry')
+    asm.pusha(); asm.db(b"\x06")  # PUSH ES
+    asm.xor_ax_ax(); asm.mov_es_ax()
+    asm.mov_di(layout.telemetry_buffer)
+    for byte in (
+        *TELEMETRY_MAGIC,
+        TELEMETRY_VERSION,
+        TELEMETRY_FRAME_TYPE,
+        TELEMETRY_PAYLOAD_BYTES,
+    ):
+        asm.mov_al(byte); asm.stosb()
+
+    asm.mov_ax(configuration_id(config)); asm.stosw()
+    for address in (
+        DATA_BASE - 4,   # tick
+        DATA_BASE - 2,   # PRNG state
+        DATA_BASE - 6,   # replacements
+        DATA_BASE - 8,   # captures
+        DATA_BASE - 14,  # starvations
+        DATA_BASE - 16,  # successful-forager turnovers
+    ):
+        asm.mov_bx(address); asm.db(b"\x8B\x07"); asm.stosw()
+
+    # Reserve energy sum, sense sum, four speed bins, max generation, and
+    # the state checksum. All are filled below.
+    asm.xor_ax_ax(); asm.mov_cx(6); asm.rep_stosw()
+
+    asm.mov_si(prey_base); asm.mov_cx(NUM_PREY)
+    asm.label('telemetry_metric_loop')
+    asm.db(b"\x8B\x44\x04")  # MOV AX, [SI+4]
+    asm.db(b"\x01\x06"); asm.dw(layout.telemetry_buffer + 19)
+    asm.db(b"\x8B\x44\x08")  # MOV AX, [SI+8]
+    asm.db(b"\x01\x06"); asm.dw(layout.telemetry_buffer + 21)
+    asm.db(b"\x8B\x5C\x06\x4B")  # MOV BX, [SI+6]; DEC BX
+    asm.db(b"\xFE\x87"); asm.dw(layout.telemetry_buffer + 23)
+    asm.db(b"\x8B\x44\x0A")
+    asm.db(b"\x3B\x06"); asm.dw(layout.telemetry_buffer + 27)
+    asm.jle('telemetry_generation_done')
+    asm.db(b"\xA3"); asm.dw(layout.telemetry_buffer + 27)
+    asm.label('telemetry_generation_done')
+    asm.db(b"\x83\xC6"); asm.db(ENT_SIZE)
+    asm.dec_cx(); asm.jcxz('telemetry_metrics_done'); asm.jmp('telemetry_metric_loop')
+    asm.label('telemetry_metrics_done')
+
+    # Canonical guest-state checksum: a wrapping sum of every 16-bit word in
+    # the food, prey, and predator regions after the completed model update.
+    asm.mov_si(DATA_BASE)
+    asm.mov_cx((layout.data_end - DATA_BASE) // 2)
+    asm.mov_bx(0)
+    asm.label('telemetry_state_sum')
+    asm.db(b"\x03\x1C\x83\xC6\x02")  # ADD BX,[SI]; ADD SI,2
+    asm.dec_cx(); asm.jcxz('telemetry_state_done'); asm.jmp('telemetry_state_sum')
+    asm.label('telemetry_state_done')
+    asm.db(b"\x89\x1E"); asm.dw(layout.telemetry_buffer + 29)
+
+    # The final byte negates the wrapping sum from version through payload.
+    asm.mov_si(layout.telemetry_buffer + len(TELEMETRY_MAGIC))
+    asm.mov_cx(TELEMETRY_RECORD_BYTES - len(TELEMETRY_MAGIC) - 1)
+    asm.mov_bx(0)
+    asm.label('telemetry_checksum_loop')
+    asm.lodsb(); asm.db(b"\x00\xC3")
+    asm.dec_cx(); asm.jcxz('telemetry_checksum_done'); asm.jmp('telemetry_checksum_loop')
+    asm.label('telemetry_checksum_done')
+    asm.db(b"\xF6\xDB\x88\xD8\xA2")
+    asm.dw(layout.telemetry_buffer + TELEMETRY_RECORD_BYTES - 1)
+
+    asm.mov_dx(0x00E9); asm.mov_si(layout.telemetry_buffer)
+    asm.mov_cx(TELEMETRY_RECORD_BYTES)
+    asm.label('telemetry_send_loop')
+    asm.lodsb(); asm.out_dx_al()
+    asm.dec_cx(); asm.jcxz('telemetry_send_done'); asm.jmp('telemetry_send_loop')
+    asm.label('telemetry_send_done')
+    asm.db(b"\x07"); asm.popa(); asm.ret()  # POP ES
 
     # Reproducible xorshift16 PRNG. It is small enough for real mode and avoids
     # the lattice produced by the previous state += 14 sequence.
@@ -418,9 +528,9 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.label('init_prey_loop')
     asm.call('rand_x'); asm.stosw()
     asm.call('rand_y'); asm.stosw()
-    asm.mov_ax(100); asm.stosw()  # Energy
-    asm.mov_ax(2); asm.stosw()  # Speed
-    asm.mov_ax(50); asm.stosw()  # Sense
+    asm.mov_ax(config.initial_energy); asm.stosw()
+    asm.mov_ax(config.prey_initial_speed); asm.stosw()
+    asm.mov_ax(config.prey_initial_sense); asm.stosw()
     asm.mov_ax(0); asm.stosw()  # Generation
     asm.dec_cx(); asm.jcxz('init_pred'); asm.jmp('init_prey_loop')
 
@@ -430,9 +540,9 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.label('init_pred_loop')
     asm.call('rand_x'); asm.stosw()
     asm.call('rand_y'); asm.stosw()
-    asm.mov_ax(100); asm.stosw()
-    asm.mov_ax(3); asm.stosw()  # Faster
-    asm.mov_ax(100); asm.stosw()  # Better vision
+    asm.mov_ax(config.initial_energy); asm.stosw()
+    asm.mov_ax(config.predator_initial_speed); asm.stosw()
+    asm.mov_ax(config.predator_initial_sense); asm.stosw()
     asm.mov_ax(0); asm.stosw()
     asm.dec_cx(); asm.jcxz('init_done'); asm.jmp('init_pred_loop')
     asm.label('init_done'); asm.ret()
@@ -474,14 +584,15 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.db(b"\x89\xFD")  # MOV BP, DI (destination slot)
     asm.call('rand_x'); asm.db(b"\x89\x46\x00")
     asm.call('rand_y'); asm.db(b"\x89\x46\x02")
-    asm.mov_ax(100); asm.db(b"\x89\x46\x04")
+    asm.mov_ax(config.initial_energy); asm.db(b"\x89\x46\x04")
 
     asm.label('random_parent_retry')
-    asm.call('rand'); asm.and_ax(0x001F); asm.cmp_ax(NUM_PREY)
+    parent_mask = (1 << (NUM_PREY - 1).bit_length()) - 1
+    asm.call('rand'); asm.and_ax(parent_mask); asm.cmp_ax(NUM_PREY)
     asm.jge('random_parent_retry')
     asm.label('parent_index_ready')
     asm.db(b"\x89\xC3\xC1\xE0\x03\xC1\xE3\x02\x01\xD8")  # AX=index*12
-    asm.mov_si(DATA_BASE + (NUM_FOOD * 6)); asm.db(b"\x01\xC6")
+    asm.mov_si(prey_base); asm.db(b"\x01\xC6")
     asm.jmp('inherit_genes')
 
     asm.label('rebirth_self')
@@ -489,28 +600,28 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.db(b"\x89\xFD")
     asm.call('rand_x'); asm.db(b"\x89\x46\x00")
     asm.call('rand_y'); asm.db(b"\x89\x46\x02")
-    asm.mov_ax(100); asm.db(b"\x89\x46\x04")
+    asm.mov_ax(config.initial_energy); asm.db(b"\x89\x46\x04")
     asm.db(b"\x89\xEE")  # MOV SI, BP
 
     asm.label('inherit_genes')
 
-    # Speed: inherit, then occasionally mutate within 1..4.
-    asm.db(b"\x8B\x5C\x06"); asm.call('rand'); asm.db(b"\xA8\x03")
+    # Speed: inherit, then occasionally mutate within configured bounds.
+    asm.db(b"\x8B\x5C\x06"); asm.call('rand'); asm.db(b"\xA8"); asm.db(config.mutation_mask)
     asm.jne('speed_store'); asm.call('rand'); asm.db(b"\xA8\x01")
     asm.je('speed_down')
-    asm.db(0x43); asm.cmp_bx(4); asm.jle('speed_store'); asm.mov_bx(4); asm.jmp('speed_store')
+    asm.db(0x43); asm.cmp_bx(config.speed_max); asm.jle('speed_store'); asm.mov_bx(config.speed_max); asm.jmp('speed_store')
     asm.label('speed_down')
-    asm.db(0x4B); asm.cmp_bx(1); asm.jge('speed_store'); asm.mov_bx(1)
+    asm.db(0x4B); asm.cmp_bx(config.speed_min); asm.jge('speed_store'); asm.mov_bx(config.speed_min)
     asm.label('speed_store'); asm.db(b"\x89\x5E\x06")
 
-    # Sense: inherit, then occasionally mutate by eight pixels within 24..120.
-    asm.db(b"\x8B\x5C\x08"); asm.call('rand'); asm.db(b"\xA8\x03")
+    # Sense: inherit, then occasionally mutate by the configured step.
+    asm.db(b"\x8B\x5C\x08"); asm.call('rand'); asm.db(b"\xA8"); asm.db(config.mutation_mask)
     asm.jne('sense_store'); asm.call('rand'); asm.db(b"\xA8\x01")
     asm.je('sense_down')
-    asm.db(b"\x83\xC3\x08"); asm.cmp_bx(120); asm.jle('sense_store')
-    asm.mov_bx(120); asm.jmp('sense_store')
+    asm.db(b"\x83\xC3"); asm.db(config.sense_mutation_step); asm.cmp_bx(config.sense_max); asm.jle('sense_store')
+    asm.mov_bx(config.sense_max); asm.jmp('sense_store')
     asm.label('sense_down')
-    asm.db(b"\x83\xEB\x08"); asm.cmp_bx(24); asm.jge('sense_store'); asm.mov_bx(24)
+    asm.db(b"\x83\xEB"); asm.db(config.sense_mutation_step); asm.cmp_bx(config.sense_min); asm.jge('sense_store'); asm.mov_bx(config.sense_min)
     asm.label('sense_store'); asm.db(b"\x89\x5E\x08")
 
     asm.db(b"\x8B\x44\x0A"); asm.inc_ax(); asm.db(b"\x89\x46\x0A")
@@ -537,11 +648,11 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
 
     # Recompute day/night because drawing calls use DX.
     asm.pusha()
-    asm.mov_bx(DATA_BASE - 4); asm.db(0x8B); asm.db(0x07); asm.db(0xA9); asm.dw(0x0100)
+    asm.mov_bx(DATA_BASE - 4); asm.db(0x8B); asm.db(0x07); asm.db(0xA9); asm.dw(config.day_night_mask)
     asm.popa()
     asm.je('prey_awake')
     # Night: sleep and recover, capped at the reproduction threshold.
-    asm.db(b"\x81\x7C\x04"); asm.dw(160); asm.jl('prey_night_heal')
+    asm.db(b"\x81\x7C\x04"); asm.dw(config.reproduction_energy); asm.jl('prey_night_heal')
     asm.jmp('prey_draw')
     asm.label('prey_night_heal')
     asm.db(b"\x83\x44\x04\x01")
@@ -550,11 +661,12 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.label('prey_awake')
     asm.db(b"\xFF\x4C\x04")  # metabolism: DEC word [SI+4]
     asm.jne('prey_has_energy')
+    asm.mov_bx(DATA_BASE - 14); asm.db(b"\xFF\x07")  # starvations++
     asm.db(b"\x89\xF7"); asm.call('rebirth_prey'); asm.jmp('prey_draw')
 
     asm.label('prey_has_energy')
     # Flee when any predator is inside the inherited sense radius.
-    asm.mov_di(DATA_BASE + (NUM_FOOD * 6) + (NUM_PREY * ENT_SIZE))
+    asm.mov_di(predator_base)
     asm.mov_dx(NUM_PRED)
     asm.label('flee_scan')
     asm.db(b"\x8B\x04\x2B\x05"); asm.cmp_ax(0); asm.jge('flee_x_pos')
@@ -593,8 +705,8 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.label('prey_move_done')
     asm.call('clamp_entity')
 
-    # Water creates a persistent upward drag below y=170.
-    asm.db(b"\x81\x7C\x02"); asm.dw(170)
+    # Water creates a persistent upward drag below the configured waterline.
+    asm.db(b"\x81\x7C\x02"); asm.dw(config.waterline)
     asm.jl('not_water')
     asm.db(b"\xFF\x4C\x02")
     asm.label('not_water')
@@ -611,8 +723,9 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
 
     asm.call('rand_x'); asm.db(b"\x89\x05")
     asm.call('rand_y'); asm.db(b"\x89\x45\x02")
-    asm.db(b"\x83\x44\x04\x14")
-    asm.db(b"\x81\x7C\x04"); asm.dw(160); asm.jl('prey_ate')
+    asm.db(b"\x81\x44\x04"); asm.dw(config.food_energy)
+    asm.db(b"\x81\x7C\x04"); asm.dw(config.reproduction_energy); asm.jl('prey_ate')
+    asm.mov_bx(DATA_BASE - 16); asm.db(b"\xFF\x07")  # forager turnovers++
     asm.db(b"\x89\xF7"); asm.call('rebirth_self')
     asm.label('prey_ate')
     asm.mov_bx(0x0F); asm.jmp('prey_draw_c')
@@ -635,7 +748,7 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.label('pred_loop')
     asm.pusha()
 
-    asm.mov_di(DATA_BASE + (NUM_FOOD * 6))
+    asm.mov_di(prey_base)
     asm.mov_dx(NUM_PREY)
     asm.mov_bx(DATA_BASE - 12); asm.mov_ax(0x7FFF); asm.db(b"\x89\x07")
     asm.mov_bx(DATA_BASE - 10); asm.xor_ax_ax(); asm.db(b"\x89\x07")
@@ -686,7 +799,7 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.call('clamp_entity')
 
     # Eat Prey
-    asm.mov_di(DATA_BASE + (NUM_FOOD * 6)); asm.mov_dx(NUM_PREY)
+    asm.mov_di(prey_base); asm.mov_dx(NUM_PREY)
     asm.label('kill_loop')
     asm.db(b"\x8B\x04\x2B\x05"); asm.cmp_ax(0); asm.jge('kill_x_pos')
     asm.db(b"\xF7\xD8")
@@ -716,6 +829,21 @@ def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
     asm.mov_cx(5000); asm.label('d1'); asm.pusha(); asm.mov_cx(100); asm.label('d2'); asm.nop(); asm.dec_cx(); asm.jcxz('d2_d'); asm.jmp('d2'); asm.label('d2_d'); asm.popa(); asm.dec_cx(); asm.jcxz('d1_d'); asm.jmp('d1'); asm.label('d1_d'); asm.ret()
 
     return asm.image()
+
+
+def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
+    """Compatibility wrapper for the default model with a selected seed."""
+
+    try:
+        config = ModelConfig(seed=seed)
+    except ValueError as exc:
+        raise BuildError(str(exc)) from exc
+    return assemble_kernel_config(config)
+
+
+def build_kernel_config(config: ModelConfig) -> bytes:
+    return assemble_kernel_config(config).code
+
 
 def build_kernel(seed: int = DEFAULT_SEED) -> bytes:
     return assemble_kernel(seed).code
@@ -789,12 +917,16 @@ def _iso_readme() -> bytes:
         f"Version {VERSION}\r\n\r\n"
         "Boot with an x86 BIOS emulator. Controls: P pauses; R restarts.\r\n"
         "Green prey forage and inherit speed/sense traits; red predators hunt.\r\n"
-        "Builds are deterministic for a fixed --seed value.\r\n"
+        "Builds are deterministic for a fixed experiment configuration.\r\n"
+        "EXPERIMENT.JSON records the machine-readable model identity.\r\n"
         "Project: https://github.com/kai9987kai/Envo-agent-os\r\n"
     ).encode("ascii")
 
 
-def make_iso_image(floppy_data: bytes) -> bytes:
+def make_iso_image(
+    floppy_data: bytes,
+    experiment_data: bytes | None = None,
+) -> bytes:
     """Create a mountable ISO9660 + El Torito floppy-emulation image."""
     if len(floppy_data) != FLOPPY_SIZE:
         raise BuildError(f"El Torito floppy must be {FLOPPY_SIZE} bytes")
@@ -813,7 +945,13 @@ def make_iso_image(floppy_data: bytes) -> bytes:
     readme_data = _iso_readme()
     readme_lba = boot_image_lba + floppy_blocks
     readme_blocks = (len(readme_data) + ISO_SECTOR_SIZE - 1) // ISO_SECTOR_SIZE
-    volume_space_size = readme_lba + readme_blocks
+    experiment_lba = readme_lba + readme_blocks
+    experiment_blocks = (
+        (len(experiment_data) + ISO_SECTOR_SIZE - 1) // ISO_SECTOR_SIZE
+        if experiment_data is not None
+        else 0
+    )
+    volume_space_size = experiment_lba + experiment_blocks
 
     sectors = [bytearray(ISO_SECTOR_SIZE) for _ in range(volume_space_size)]
     root_record = _directory_record(
@@ -859,14 +997,24 @@ def make_iso_image(floppy_data: bytes) -> bytes:
     sectors[path_l_lba][:len(path_l)] = path_l
     sectors[path_m_lba][:len(path_m)] = path_m
 
-    root_entries = (
+    root_entries = [
         root_record,
         _directory_record(b"\x01", root_lba, ISO_SECTOR_SIZE, directory=True),
         _directory_record(b"BOOT.CAT;1", boot_catalog_lba, ISO_SECTOR_SIZE),
         _directory_record(b"BOOT.IMG;1", boot_image_lba, len(floppy_data)),
         _directory_record(b"README.TXT;1", readme_lba, len(readme_data)),
-    )
+    ]
+    if experiment_data is not None:
+        root_entries.append(
+            _directory_record(
+                b"EXPERIMENT.JSON;1",
+                experiment_lba,
+                len(experiment_data),
+            )
+        )
     root_data = b"".join(root_entries)
+    if len(root_data) > ISO_SECTOR_SIZE:
+        raise BuildError("ISO root directory does not fit in one sector")
     sectors[root_lba][:len(root_data)] = root_data
 
     catalog = sectors[boot_catalog_lba]
@@ -885,7 +1033,15 @@ def make_iso_image(floppy_data: bytes) -> bytes:
         start = block_index * ISO_SECTOR_SIZE
         chunk = floppy_data[start:start + ISO_SECTOR_SIZE]
         sectors[boot_image_lba + block_index][:len(chunk)] = chunk
-    sectors[readme_lba][:len(readme_data)] = readme_data
+    for block_index in range(readme_blocks):
+        start = block_index * ISO_SECTOR_SIZE
+        chunk = readme_data[start:start + ISO_SECTOR_SIZE]
+        sectors[readme_lba + block_index][:len(chunk)] = chunk
+    if experiment_data is not None:
+        for block_index in range(experiment_blocks):
+            start = block_index * ISO_SECTOR_SIZE
+            chunk = experiment_data[start:start + ISO_SECTOR_SIZE]
+            sectors[experiment_lba + block_index][:len(chunk)] = chunk
 
     image = b"".join(bytes(sector) for sector in sectors)
     if len(image) != volume_space_size * ISO_SECTOR_SIZE:
@@ -900,15 +1056,19 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def build_artifacts(seed: int = DEFAULT_SEED) -> BuildArtifacts:
-    kernel = build_kernel(seed)
+def build_artifacts_config(config: ModelConfig) -> BuildArtifacts:
+    """Build every artifact for one canonical experiment configuration."""
+
+    kernel = build_kernel_config(config)
     kernel_sectors = (len(kernel) + SECTOR_SIZE - 1) // SECTOR_SIZE
     boot = build_bootloader(kernel_sectors)
     floppy = make_floppy_image(boot, kernel)
-    iso = make_iso_image(floppy)
+    experiment = build_experiment_document(config, VERSION)
+    iso = make_iso_image(floppy, experiment)
 
     entries = {
         "boot.bin": boot,
+        "experiment.json": experiment,
         "kernel.bin": kernel,
         "floppy.img": floppy,
         "os.iso": iso,
@@ -918,17 +1078,36 @@ def build_artifacts(seed: int = DEFAULT_SEED) -> BuildArtifacts:
             name: {"bytes": len(data), "sha256": _sha256(data)}
             for name, data in entries.items()
         },
-        "format_version": 1,
+        "config_id": configuration_id(config),
+        "config_id_hex": f"0x{configuration_id(config):04X}",
+        "config_sha256": configuration_sha256(config),
+        "format_version": 2,
         "kernel_load_address": f"0x{KERNEL_LOAD_ADDR:04X}",
         "kernel_sectors": kernel_sectors,
+        "model_abi_version": MODEL_ABI_VERSION,
         "project": "Envo Agent OS",
-        "seed": seed,
+        "seed": config.seed,
+        "telemetry": {
+            "interval_ticks": config.telemetry_interval,
+            "record_bytes": TELEMETRY_RECORD_BYTES,
+            "version": TELEMETRY_VERSION,
+        },
         "version": VERSION,
     }
     manifest = (
         json.dumps(manifest_object, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
-    return BuildArtifacts(boot, kernel, floppy, iso, manifest)
+    return BuildArtifacts(boot, kernel, floppy, iso, manifest, experiment)
+
+
+def build_artifacts(seed: int = DEFAULT_SEED) -> BuildArtifacts:
+    """Compatibility wrapper for the default model with a selected seed."""
+
+    try:
+        config = ModelConfig(seed=seed)
+    except ValueError as exc:
+        raise BuildError(str(exc)) from exc
+    return build_artifacts_config(config)
 
 
 def _artifact_entries(artifacts: BuildArtifacts) -> dict[str, bytes]:
@@ -938,6 +1117,7 @@ def _artifact_entries(artifacts: BuildArtifacts) -> dict[str, bytes]:
         "floppy.img": artifacts.floppy,
         "os.iso": artifacts.iso,
         "build-manifest.json": artifacts.manifest,
+        "experiment.json": artifacts.experiment,
     }
 
 
@@ -973,6 +1153,20 @@ def _parse_seed(value: str) -> int:
     return seed
 
 
+def _parse_telemetry_interval(value: str) -> int:
+    try:
+        interval = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "telemetry interval must be an integer"
+        ) from exc
+    if not 1 <= interval <= 0x8000 or interval & (interval - 1):
+        raise argparse.ArgumentTypeError(
+            "telemetry interval must be a power of two in the range 1..32768"
+        )
+    return interval
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build deterministic Envo Agent OS boot media."
@@ -986,8 +1180,25 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--seed",
         type=_parse_seed,
-        default=DEFAULT_SEED,
-        help=f"non-zero 16-bit simulation seed (default: 0x{DEFAULT_SEED:04X})",
+        default=None,
+        help=(
+            "override the non-zero 16-bit simulation seed "
+            f"(default without --config: 0x{DEFAULT_SEED:04X})"
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help=(
+            "JSON model configuration or a previously generated "
+            "experiment.json"
+        ),
+    )
+    parser.add_argument(
+        "--telemetry-interval",
+        type=_parse_telemetry_interval,
+        default=None,
+        help="override the experiment telemetry interval with a power of two",
     )
     parser.add_argument(
         "--check",
@@ -1000,7 +1211,21 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Iterable[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        artifacts = build_artifacts(args.seed)
+        if args.config is None:
+            config = ModelConfig(
+                seed=args.seed or DEFAULT_SEED,
+                telemetry_interval=args.telemetry_interval or 1,
+            )
+        else:
+            config = load_model_config(args.config)
+            overrides = {}
+            if args.seed is not None:
+                overrides["seed"] = args.seed
+            if args.telemetry_interval is not None:
+                overrides["telemetry_interval"] = args.telemetry_interval
+            if overrides:
+                config = replace(config, **overrides)
+        artifacts = build_artifacts_config(config)
         output_dir = args.output_dir.resolve()
         if args.check:
             mismatches = check_artifacts(artifacts, output_dir)
@@ -1018,9 +1243,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             f"{len(artifacts.kernel)}-byte kernel in "
             f"{manifest['kernel_sectors']} sector(s)"
         )
+        print(
+            "Experiment "
+            f"{manifest['config_id_hex']} "
+            f"(telemetry every {config.telemetry_interval} tick(s))"
+        )
         print(f"Artifacts written to {output_dir}")
         return 0
-    except (BuildError, OSError) as exc:
+    except (BuildError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}")
         return 1
 

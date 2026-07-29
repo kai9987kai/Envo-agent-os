@@ -27,7 +27,13 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
 
       - name: Compile Python sources
-        run: python -m compileall -q create_iso.py tests
+        run: >-
+          python -m compileall -q
+          create_iso.py envo_config.py envo_reference.py
+          envo_telemetry.py run_experiment.py tests
+
+      - name: Lint Python sources
+        run: python -m ruff check .
 
       - name: Run tests
         run: python -m pytest -q
@@ -95,6 +101,18 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
+          from envo_config import load_model_config
+          from envo_reference import ReferenceModel
+          from envo_telemetry import (
+              load_experiment_config_id,
+              parse_frames,
+              verify_config_id,
+          )
+
+          experiment_path = Path("build/experiment.json")
+          config = load_model_config(experiment_path)
+          expected_config_id = load_experiment_config_id(experiment_path)
+          traces = {}
           for label, path in (
               ("floppy", Path("build/floppy.debug")),
               ("ISO", Path("build/iso.debug")),
@@ -102,21 +120,131 @@ jobs:
               telemetry = path.read_bytes()
               boot = telemetry.find(b"B")
               kernel = telemetry.find(b"K", boot + 1)
-              frame = telemetry.find(b"F", kernel + 1)
-
-              if not (0 <= boot < kernel < frame):
+              if not (0 <= boot < kernel):
                   raise SystemExit(
-                      f"{label}: missing ordered B -> K -> F markers; "
+                      f"{label}: missing ordered B -> K stage markers; "
                       f"telemetry={telemetry.hex()}"
                   )
-              if len(telemetry) < frame + 4 or telemetry[frame + 3] != 0x0A:
+              first_frame = telemetry.find(b"EV", kernel + 1)
+              if first_frame < 0:
                   raise SystemExit(
-                      f"{label}: incomplete first telemetry frame; "
+                      f"{label}: no telemetry frame header after K marker; "
                       f"telemetry={telemetry.hex()}"
                   )
 
+              # QEMU is deliberately terminated at the timeout, so its final
+              # frame may be partial. Lenient extraction ignores only that
+              # trailing fragment/corrupt candidates; every returned frame
+              # has passed the protocol header and checksum validation.
+              frames = parse_frames(telemetry, strict=False)
+              if not frames:
+                  raise SystemExit(
+                      f"{label}: no valid v2 telemetry frame; "
+                      f"telemetry={telemetry.hex()}"
+                  )
+              verify_config_id(frames, expected_config_id)
+              reference_by_tick = {
+                  frame.tick: frame
+                  for frame in ReferenceModel(config).run(frames[-1].tick)
+              }
+
+              for index, frame in enumerate(frames):
+                  speed_total = (
+                      frame.speed_1_count
+                      + frame.speed_2_count
+                      + frame.speed_3_count
+                      + frame.speed_4_count
+                  )
+                  if frame.tick & (config.telemetry_interval - 1):
+                      raise SystemExit(
+                          f"{label}: frame {index} tick {frame.tick} is not "
+                          f"aligned to interval {config.telemetry_interval}"
+                      )
+                  if speed_total != config.prey_count:
+                      raise SystemExit(
+                          f"{label}: frame {index} speed bins total "
+                          f"{speed_total}, expected {config.prey_count}"
+                      )
+                  if not (
+                      config.sense_min * config.prey_count
+                      <= frame.prey_sense_sum
+                      <= config.sense_max * config.prey_count
+                  ):
+                      raise SystemExit(
+                          f"{label}: frame {index} prey sense sum "
+                          f"{frame.prey_sense_sum} is outside configured bounds"
+                      )
+                  if not (
+                      0
+                      < frame.prey_energy_sum
+                      <= config.reproduction_energy * config.prey_count
+                  ):
+                      raise SystemExit(
+                          f"{label}: frame {index} prey energy sum "
+                          f"{frame.prey_energy_sum} is outside model bounds"
+                      )
+                  event_replacements = (
+                      frame.captures
+                      + frame.starvations
+                      + frame.forager_turnovers
+                  ) & 0xFFFF
+                  if frame.replacements != event_replacements:
+                      raise SystemExit(
+                          f"{label}: frame {index} replacement accounting "
+                          "does not match capture/starvation/turnover counters"
+                      )
+                  if frame.max_generation > frame.replacements:
+                      raise SystemExit(
+                          f"{label}: frame {index} generation "
+                          f"{frame.max_generation} exceeds replacement count "
+                          f"{frame.replacements}"
+                      )
+                  if reference_by_tick.get(frame.tick) != frame:
+                      raise SystemExit(
+                          f"{label}: frame {index} differs from the exact "
+                          f"Python reference at tick {frame.tick}; "
+                          f"guest={frame!r}; "
+                          f"reference={reference_by_tick.get(frame.tick)!r}"
+                      )
+                  if index:
+                      tick_step = (frame.tick - frames[index - 1].tick) & 0xFFFF
+                      if tick_step != config.telemetry_interval:
+                          raise SystemExit(
+                              f"{label}: frame {index} tick step {tick_step}, "
+                              f"expected {config.telemetry_interval}"
+                          )
+
+              traces[label] = frames
               print(
-                  f"{label}: boot smoke passed with "
-                  f"{telemetry[:frame + 4].hex()}"
+                  f"{label}: boot smoke passed at tick "
+                  f"{frames[0].tick} with state checksum "
+                  f"0x{frames[0].state_checksum:04x}"
               )
+
+          common_frames = min(len(traces["floppy"]), len(traces["ISO"]))
+          if common_frames < 1:
+              raise SystemExit("no common valid floppy/ISO telemetry prefix")
+          for index in range(common_frames):
+              floppy_frame = traces["floppy"][index]
+              iso_frame = traces["ISO"][index]
+              if floppy_frame.tick != iso_frame.tick:
+                  raise SystemExit(
+                      f"frame {index}: floppy/ISO tick mismatch "
+                      f"{floppy_frame.tick} != {iso_frame.tick}"
+                  )
+              if floppy_frame.state_checksum != iso_frame.state_checksum:
+                  raise SystemExit(
+                      f"frame {index}: floppy/ISO state checksum mismatch "
+                      f"0x{floppy_frame.state_checksum:04x} != "
+                      f"0x{iso_frame.state_checksum:04x}"
+                  )
+              if floppy_frame != iso_frame:
+                  raise SystemExit(
+                      f"frame {index}: floppy/ISO payload mismatch; "
+                      f"floppy={floppy_frame!r}; ISO={iso_frame!r}"
+                  )
+          print(
+              f"floppy/ISO deterministic prefix: {common_frames} "
+              "checksummed frames"
+          )
           PY
