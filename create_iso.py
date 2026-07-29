@@ -1,44 +1,126 @@
+"""Dependency-free builder for the Envo Agent OS retro image.
+
+The Python assembler is the canonical source for the boot sector and kernel.
+All checked-in binary artifacts are produced from this module.
+"""
+
+# Compact semicolon-separated assembler calls intentionally mirror instruction
+# groups in the generated 16-bit program.
+# ruff: noqa: E701, E702
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
 import struct
-import os
-import sys
+from typing import Iterable
+
+
+VERSION = "1.1.0"
+SECTOR_SIZE = 512
+ISO_SECTOR_SIZE = 2048
+FLOPPY_SIZE = 1_474_560
+KERNEL_LOAD_ADDR = 0x1000
+MAX_KERNEL_SECTORS = 17  # sectors 2..18 on the first 1.44 MB floppy track
+DEFAULT_SEED = 0xACE1
+DATA_BASE = 0x9000
+NUM_PREY = 30
+NUM_PRED = 4
+NUM_FOOD = 50
+ENT_SIZE = 12
+
+
+class BuildError(RuntimeError):
+    """Raised when an image cannot be assembled safely."""
+
+
+class AssemblyError(BuildError):
+    """Raised for invalid labels, branches, or instruction operands."""
+
+
+@dataclass(frozen=True)
+class AssemblyImage:
+    code: bytes
+    symbols: dict[str, int]
+
+
+@dataclass(frozen=True)
+class BuildArtifacts:
+    boot: bytes
+    kernel: bytes
+    floppy: bytes
+    iso: bytes
+    manifest: bytes
 
 # --- MINI ASSEMBLER ---
 class ASM:
     def __init__(self, org=0):
         self.code = bytearray()
         self.labels = {}
-        self.patches = [] 
+        self.patches = []
         self.org = org
 
     def current_addr(self): return self.org + len(self.code)
-    def label(self, name): self.labels[name] = self.current_addr()
+    def label(self, name):
+        if name in self.labels:
+            raise AssemblyError(f"Duplicate label: {name}")
+        self.labels[name] = self.current_addr()
+
     def db(self, data):
-        if isinstance(data, int): self.code.append(data)
+        if isinstance(data, int):
+            if not 0 <= data <= 0xFF:
+                raise AssemblyError(f"Byte outside range: {data}")
+            self.code.append(data)
         elif isinstance(data, bytes): self.code.extend(data)
         elif isinstance(data, str): self.code.extend(data.encode('ascii'))
-    def dw(self, val): self.code.extend(struct.pack('<H', val & 0xFFFF))
+        else:
+            raise AssemblyError(f"Unsupported byte data: {type(data).__name__}")
+
+    def dw(self, val):
+        if not -0x8000 <= val <= 0xFFFF:
+            raise AssemblyError(f"Word outside range: {val}")
+        self.code.extend(struct.pack('<H', val & 0xFFFF))
+
+    def _relative_patch(self, opcode, label, size):
+        self.db(opcode)
+        self.patches.append((len(self.code), label, size, True))
+        for _ in range(size):
+            self.db(0)
+
+    def _absolute_patch(self, label):
+        self.patches.append((len(self.code), label, 2, False))
+        self.dw(0)
 
     # Instructions
     def nop(self): self.db(0x90)
     def cli(self): self.db(0xFA)
     def sti(self): self.db(0xFB)
+    def cld(self): self.db(0xFC)
     def hlt(self): self.db(0xF4)
     def ret(self): self.db(0xC3)
     def pusha(self): self.db(0x60)
     def popa(self): self.db(0x61)
+    def push_bx(self): self.db(0x53)
+    def push_dx(self): self.db(0x52)
+    def pop_bx(self): self.db(0x5B)
+    def pop_dx(self): self.db(0x5A)
     def int_(self, imm): self.db(0xCD); self.db(imm)
-    
-    def jmp(self, label): self.db(0xE9); self.patches.append((len(self.code), label, 2, True)); self.db(0x00); self.db(0x00)
-    def je(self, label): self.db(0x74); self.patches.append((len(self.code), label, 1, True)); self.db(0x00)
-    def jne(self, label): self.db(0x75); self.patches.append((len(self.code), label, 1, True)); self.db(0x00)
-    def jl(self, label): self.db(0x7C); self.patches.append((len(self.code), label, 1, True)); self.db(0x00)
-    def jg(self, label): self.db(0x7F); self.patches.append((len(self.code), label, 1, True)); self.db(0x00)
-    def jle(self, label): self.db(0x7E); self.patches.append((len(self.code), label, 1, True)); self.db(0x00)
-    def jge(self, label): self.db(0x7D); self.patches.append((len(self.code), label, 1, True)); self.db(0x00)
-    def jcxz(self, label): self.db(0xE3); self.patches.append((len(self.code), label, 1, True)); self.db(0x00)
-    def jc(self, label): self.db(0x72); self.patches.append((len(self.code), label, 1, True)); self.db(0x00)
 
-    def call(self, label): self.db(0xE8); self.patches.append((len(self.code), label, 2, True)); self.db(0x00); self.db(0x00)
+    def jmp(self, label): self._relative_patch(0xE9, label, 2)
+    def je(self, label): self._relative_patch(0x74, label, 1)
+    def jne(self, label): self._relative_patch(0x75, label, 1)
+    def jl(self, label): self._relative_patch(0x7C, label, 1)
+    def jg(self, label): self._relative_patch(0x7F, label, 1)
+    def jle(self, label): self._relative_patch(0x7E, label, 1)
+    def jge(self, label): self._relative_patch(0x7D, label, 1)
+    def jcxz(self, label): self._relative_patch(0xE3, label, 1)
+    def jc(self, label): self._relative_patch(0x72, label, 1)
+    def jnc(self, label): self._relative_patch(0x73, label, 1)
+
+    def call(self, label): self._relative_patch(0xE8, label, 2)
 
     # MOV
     def mov_al(self, val): self.db(0xB0); self.db(val)
@@ -47,24 +129,39 @@ class ASM:
     def mov_cx(self, val): self.db(0xB9); self.dw(val)
     def mov_dx(self, val): self.db(0xBA); self.dw(val)
     def mov_si(self, val): self.db(0xBE); self.dw(val)
+    def mov_si_label(self, label):
+        self.db(0xBE)
+        self._absolute_patch(label)
+
     def mov_di(self, val): self.db(0xBF); self.dw(val)
     def mov_sp(self, val): self.db(0xBC); self.dw(val)
     def mov_bp(self, val): self.db(0xBD); self.dw(val)
-    
+
     def mov_ds_ax(self): self.db(0x8E); self.db(0xD8)
     def mov_es_ax(self): self.db(0x8E); self.db(0xC0)
     def mov_ss_ax(self): self.db(0x8E); self.db(0xD0)
+    def mov_mem_dl(self, label):
+        self.db(b"\x88\x16")
+        self._absolute_patch(label)
+
+    def mov_dl_mem(self, label):
+        self.db(b"\x8A\x16")
+        self._absolute_patch(label)
 
     # Arithmetic
     def xor_ax_ax(self): self.db(0x31); self.db(0xC0)
     def xor_di_di(self): self.db(0x31); self.db(0xFF)
+    def and_ax(self, val): self.db(0x25); self.dw(val)
+    def add_ax(self, val): self.db(0x05); self.dw(val)
+    def sub_ax(self, val): self.db(0x2D); self.dw(val)
     def inc_di(self): self.db(0x47)
     def inc_si(self): self.db(0x46)
     def inc_ax(self): self.db(0x40)
     def inc_cx(self): self.db(0x41)
     def dec_cx(self): self.db(0x49)
     def dec_dx(self): self.db(0x4A)
-    
+    def dec_si(self): self.db(0x4E)
+
     def cmp_al(self, val): self.db(0x3C); self.db(val)
     def cmp_ax(self, val): self.db(0x3D); self.dw(val)
     def cmp_cx(self, val): self.db(0x81); self.db(0xF9); self.dw(val)
@@ -77,82 +174,142 @@ class ASM:
     # String
     def lodsb(self): self.db(0xAC)
     def stosb(self): self.db(0xAA)
+    def stosw(self): self.db(0xAB)
     def rep_stosb(self): self.db(0xF3); self.db(0xAA)
 
     # IO
     def out_dx_al(self): self.db(0xEE)
 
     def resolve(self):
+        code = bytearray(self.code)
         for offset, label, size, relative in self.patches:
-            if label not in self.labels: print(f"Error: Undefined label '{label}'"); continue
+            if label not in self.labels:
+                raise AssemblyError(f"Undefined label: {label}")
             target = self.labels[label]
             if relative:
                 pc = self.org + offset + size
                 diff = target - pc
-                if size == 1: self.code[offset] = diff & 0xFF
-                elif size == 2: struct.pack_into('<h', self.code, offset, diff)
-            else: struct.pack_into('<H', self.code, offset, target)
-        return self.code
+                lower, upper = (-128, 127) if size == 1 else (-32768, 32767)
+                if not lower <= diff <= upper:
+                    raise AssemblyError(
+                        f"Branch to {label} is out of range ({diff} for {size * 8}-bit displacement)"
+                    )
+                if size == 1:
+                    code[offset] = diff & 0xFF
+                elif size == 2:
+                    struct.pack_into('<h', code, offset, diff)
+            else:
+                if not 0 <= target <= 0xFFFF:
+                    raise AssemblyError(f"Absolute label {label} is outside real-mode range")
+                struct.pack_into('<H', code, offset, target)
+        return bytes(code)
+
+    def image(self):
+        return AssemblyImage(self.resolve(), dict(self.labels))
 
 # --- BUILDER ---
 
-def build_bootloader():
-    asm = ASM(org=0x7C00)
-    asm.xor_ax_ax(); asm.mov_ds_ax(); asm.mov_es_ax(); asm.mov_ss_ax(); asm.mov_sp(0x7C00)
-    asm.mov_bx(0x0007); asm.mov_ax(0x0E42); asm.int_(0x10) # 'B'
-    asm.xor_ax_ax(); asm.int_(0x13)
-    asm.mov_bx(0x1000); asm.mov_ax(0x020A); asm.mov_cx(0x0002); asm.db(0xB6); asm.db(0x00); asm.int_(0x13)
-    asm.jc('disk_error')
-    asm.db(0xEA); asm.dw(0x1000); asm.dw(0x0000) # JMP FAR
-    asm.label('disk_error'); asm.mov_ax(0x0E45); asm.int_(0x10); asm.hlt(); asm.jmp('disk_error')
-    code = asm.resolve()
-    code += b'\x00' * (510 - len(code)) + b'\x55\xAA'
-    return code
+def assemble_bootloader(kernel_sectors: int) -> AssemblyImage:
+    if not 1 <= kernel_sectors <= MAX_KERNEL_SECTORS:
+        raise BuildError(
+            f"Kernel requires {kernel_sectors} sectors; BIOS stage-1 supports "
+            f"1..{MAX_KERNEL_SECTORS} sectors"
+        )
 
-def build_kernel():
+    asm = ASM(org=0x7C00)
+    asm.cli()
+    asm.xor_ax_ax(); asm.mov_ds_ax(); asm.mov_es_ax(); asm.mov_ss_ax(); asm.mov_sp(0x7C00)
+    asm.sti(); asm.cld()
+    asm.mov_mem_dl('boot_drive')
+
+    # Bochs/QEMU debug console marker: stage 1 reached.
+    asm.mov_dx(0x00E9); asm.mov_al(ord('B')); asm.out_dx_al()
+    asm.mov_si(3)
+    asm.label('disk_retry')
+    asm.mov_dl_mem('boot_drive')
+    asm.xor_ax_ax(); asm.int_(0x13)
+    asm.xor_ax_ax(); asm.mov_es_ax()
+    asm.mov_bx(KERNEL_LOAD_ADDR)
+    asm.mov_ax(0x0200 | kernel_sectors)
+    asm.mov_cx(0x0002)  # cylinder 0, sector 2
+    asm.db(b"\xB6\x00")  # MOV DH, 0 (head 0)
+    asm.mov_dl_mem('boot_drive')
+    asm.int_(0x13)
+    asm.jnc('load_ok')
+    asm.dec_si(); asm.jne('disk_retry')
+
+    asm.mov_si_label('disk_error_msg'); asm.call('print_string')
+    asm.label('disk_error')
+    asm.cli(); asm.hlt(); asm.jmp('disk_error')
+
+    asm.label('load_ok')
+    asm.db(0xEA); asm.dw(KERNEL_LOAD_ADDR); asm.dw(0x0000)  # JMP FAR 0000:1000
+
+    asm.label('print_string')
+    asm.mov_bx(0x0007)
+    asm.label('print_loop')
+    asm.lodsb(); asm.cmp_al(0); asm.je('print_done')
+    asm.db(b"\xB4\x0E")  # MOV AH, 0x0E
+    asm.int_(0x10); asm.jmp('print_loop')
+    asm.label('print_done'); asm.ret()
+
+    asm.label('boot_drive'); asm.db(0)
+    asm.label('disk_error_msg'); asm.db(b"\r\nEnvo disk read failed\r\n\x00")
+
+    code = asm.resolve()
+    if len(code) > 510:
+        raise BuildError(f"Boot sector is {len(code)} bytes; maximum is 510")
+    padded = code + b'\x00' * (510 - len(code)) + b'\x55\xAA'
+    return AssemblyImage(padded, dict(asm.labels))
+
+
+def build_bootloader(kernel_sectors: int = 1) -> bytes:
+    return assemble_bootloader(kernel_sectors).code
+
+
+def assemble_kernel(seed: int = DEFAULT_SEED) -> AssemblyImage:
+    if not 1 <= seed <= 0xFFFF:
+        raise BuildError("Seed must be in the range 1..65535")
+
     asm = ASM(org=0x1000)
-    
+
     # --- CONSTANTS ---
-    COLOR_BG = 0x01   
-    COLOR_PREY = 0x2F 
-    COLOR_PRED = 0x28 
-    COLOR_FOOD = 0x2C 
-    COLOR_WATER = 0x33 # Light Blue
-    
+    COLOR_PREY = 0x2F
+    COLOR_PRED = 0x28
+    COLOR_FOOD = 0x2C
+
     VGA_SEG = 0xA000
-    SCREEN_W = 320; SCREEN_H = 200
-    
-    NUM_PREY = 30
-    NUM_PRED = 4
-    NUM_FOOD = 50
-    
-    # Entity Struct: [X(2), Y(2), Energy(2), GeneSpeed(2), GeneSense(2), State(2)] = 12 bytes
-    ENT_SIZE = 12
-    
-    DATA_BASE = 0x9000
-    # DB-2: PRNG, DB-4: Time, DB-6: PreyScore, DB-8: PredScore
-    # DB-10: TempTarget
-    
+
+    # Entity: X, Y, energy, speed, sense, generation (six 16-bit words).
+    # Scratch words below DATA_BASE: PRNG, tick, births, kills, target, min distance.
+
     asm.label('start')
-    asm.xor_ax_ax(); asm.mov_ds_ax(); asm.mov_es_ax(); asm.mov_ss_ax(); asm.mov_sp(0x7C00) 
-    asm.mov_ax(0x0013); asm.int_(0x10) # Mode 13h 
-    # Init Variables
-    asm.mov_bx(DATA_BASE - 4); asm.xor_ax_ax(); asm.db(0x89); asm.db(0x07) # Time = 0
-    
+    asm.cli()
+    asm.xor_ax_ax(); asm.mov_ds_ax(); asm.mov_es_ax(); asm.mov_ss_ax(); asm.mov_sp(0x7C00)
+    asm.sti(); asm.cld()
+    asm.mov_dx(0x00E9); asm.mov_al(ord('K')); asm.out_dx_al()
+    asm.mov_ax(0x0013); asm.int_(0x10)  # VGA mode 13h
+
+    # Reproducible runtime state.
+    asm.mov_bx(DATA_BASE - 2); asm.mov_ax(seed); asm.db(b"\x89\x07")
+    asm.xor_ax_ax()
+    for offset in (4, 6, 8, 10, 12):
+        asm.mov_bx(DATA_BASE - offset); asm.db(b"\x89\x07")
+
     # Reset ES to 0 for data operations
     asm.xor_ax_ax(); asm.mov_es_ax()
-    
+
     asm.call('init_entities')
-    
+
     # --- MAIN LOOP ---
     asm.label('main_loop')
-    
+
     # 0. Time & Day/Night Cycle
     asm.mov_bx(DATA_BASE - 4)
     asm.db(0x8B); asm.db(0x07) # MOV AX, [BX]
     asm.inc_ax()
     asm.db(0x89); asm.db(0x07) # MOV [BX], AX
-    
+
     # Palette Shifting (Simulate Day/Night)
     # Check if Time bit 8 is set (Cycle speed)
     asm.db(0xA9); asm.dw(0x0100) # TEST AX, 0x100
@@ -164,7 +321,7 @@ def build_kernel():
     asm.label('is_day')
     asm.mov_dx(0) # Day
     asm.label('time_done')
-    
+
     # 1. Input
     asm.mov_ax(0x0100); asm.int_(0x16); asm.je('no_key')
     asm.mov_ax(0x0000); asm.int_(0x16)
@@ -174,7 +331,7 @@ def build_kernel():
     asm.label('key_restart'); asm.jmp('start')
     asm.label('key_pause'); asm.mov_ax(0); asm.int_(0x16); asm.cmp_al(112); asm.je('no_key'); asm.jmp('key_pause')
     asm.label('no_key')
-    
+
     # 2. Draw BG
     asm.mov_ax(VGA_SEG); asm.mov_es_ax()
     asm.xor_di_di(); asm.mov_cx(32000)
@@ -183,31 +340,30 @@ def build_kernel():
     asm.mov_ax(0x0101); asm.jmp('bg_draw')
     asm.label('bg_night'); asm.mov_ax(0x1010)
     asm.label('bg_draw'); asm.db(0xF3); asm.db(0xAB)
-    
+
     # Draw Water (Bottom 30 pixels)
     asm.mov_di(320 * 170)
     asm.mov_cx(320 * 30 // 2)
     asm.mov_ax(0x3333) # Water Color
     asm.db(0xF3); asm.db(0xAB)
-    
+
     # Draw Fireflies (If Night)
     asm.cmp_dx(1); asm.jne('skip_fireflies')
     asm.mov_cx(20) # 20 Fireflies
     asm.label('firefly_loop')
-    asm.call('rand'); asm.mov_di(0); asm.db(0x89); asm.db(0xC7) # Random Pos
-    asm.cmp_di(64000); asm.jge('ff_next') # Safety
-    asm.mov_ax(0x2C2C); asm.db(0xAA) # Yellow pixel
+    asm.call('rand'); asm.and_ax(0x7FFF); asm.mov_di(0); asm.db(b"\x89\xC7")
+    asm.mov_ax(0x2C2C); asm.stosb()  # Yellow pixel in the upper half
     asm.label('ff_next')
     asm.dec_cx(); asm.jcxz('skip_fireflies'); asm.jmp('firefly_loop')
     asm.label('skip_fireflies')
-    
+
     # Draw UI (Sun/Moon)
     asm.mov_di(320*5 + 300) # Top Right
     asm.cmp_dx(1); asm.je('draw_moon')
     asm.mov_ax(0x2C2C); asm.jmp('draw_celest') # Sun (Yellow)
     asm.label('draw_moon'); asm.mov_ax(0x0F0F) # Moon (White)
     asm.label('draw_celest'); asm.db(0xAA); asm.db(0xAA); asm.db(0xAA); asm.db(0xAA) # 4 pixels
-    
+
     # 3. Update Entities
     # Food
     asm.mov_si(DATA_BASE); asm.mov_cx(NUM_FOOD); asm.call('update_food')
@@ -215,51 +371,69 @@ def build_kernel():
     asm.mov_si(DATA_BASE + (NUM_FOOD * 6)); asm.mov_cx(NUM_PREY); asm.call('update_prey')
     # Pred
     asm.mov_si(DATA_BASE + (NUM_FOOD * 6) + (NUM_PREY * ENT_SIZE)); asm.mov_cx(NUM_PRED); asm.call('update_pred')
-    
+
+    # Machine-readable frame telemetry on the Bochs/QEMU debug port:
+    # "F", births-low-byte, kills-low-byte, newline.
+    asm.mov_dx(0x00E9); asm.mov_al(ord('F')); asm.out_dx_al()
+    asm.mov_bx(DATA_BASE - 6); asm.db(b"\x8B\x07"); asm.out_dx_al()
+    asm.mov_bx(DATA_BASE - 8); asm.db(b"\x8B\x07"); asm.out_dx_al()
+    asm.mov_al(0x0A); asm.out_dx_al()
+
     asm.call('delay')
     asm.jmp('main_loop')
-    
+
     # --- FUNCTIONS ---
-    
-    # PRNG
+
+    # Reproducible xorshift16 PRNG. It is small enough for real mode and avoids
+    # the lattice produced by the previous state += 14 sequence.
     asm.label('rand')
-    asm.db(0x53); asm.mov_bx(DATA_BASE - 2); asm.db(0x8B); asm.db(0x07)
-    asm.inc_ax(); asm.db(0x05); asm.dw(13); asm.db(0x89); asm.db(0x07); asm.db(0x5B); asm.ret()
+    asm.push_bx(); asm.push_dx()
+    asm.mov_bx(DATA_BASE - 2); asm.db(b"\x8B\x07")  # MOV AX, [BX]
+    asm.db(b"\x89\xC2\xC1\xE0\x07\x31\xC2")  # DX=AX; AX<<=7; DX^=AX
+    asm.db(b"\x89\xD0\x89\xC2\xC1\xE8\x09\x31\xC2")  # AX=DX; DX=AX; AX>>=9; DX^=AX
+    asm.db(b"\x89\xD0\x89\xC2\xC1\xE0\x08\x31\xD0")  # AX=DX; DX=AX; AX<<=8; AX^=DX
+    asm.db(b"\x89\x07")
+    asm.pop_dx(); asm.pop_bx(); asm.ret()
+
+    asm.label('rand_x')
+    asm.call('rand'); asm.and_ax(0x00FF); asm.add_ax(32); asm.ret()  # 32..287
+    asm.label('rand_y')
+    asm.call('rand'); asm.and_ax(0x007F); asm.add_ax(24); asm.ret()  # 24..151
 
     # Init
     asm.label('init_entities')
     asm.mov_di(DATA_BASE)
-    
+
     # Food (Simple X,Y)
     asm.mov_cx(NUM_FOOD)
     asm.label('init_food')
-    asm.call('rand'); asm.db(0x25); asm.dw(300); asm.db(0x05); asm.dw(10); asm.db(0xAA); asm.db(0x00) # X
-    asm.call('rand'); asm.db(0x25); asm.dw(180); asm.db(0x05); asm.dw(10); asm.db(0xAA); asm.db(0x00) # Y
-    asm.mov_ax(0); asm.db(0xAB) # Padding
+    asm.call('rand_x'); asm.stosw()
+    asm.call('rand_y'); asm.stosw()
+    asm.mov_ax(0); asm.stosw()  # Padding
     asm.dec_cx(); asm.jcxz('init_prey'); asm.jmp('init_food')
-    
+
     # Prey (Advanced Struct)
     asm.label('init_prey')
     asm.mov_cx(NUM_PREY)
     asm.label('init_prey_loop')
-    asm.call('rand'); asm.db(0x25); asm.dw(300); asm.db(0x05); asm.dw(10); asm.db(0xAA); asm.db(0x00) # X
-    asm.call('rand'); asm.db(0x25); asm.dw(180); asm.db(0x05); asm.dw(10); asm.db(0xAA); asm.db(0x00) # Y
-    asm.mov_ax(100); asm.db(0xAB) # Energy
-    asm.mov_ax(2); asm.db(0xAB) # GeneSpeed (2)
-    asm.mov_ax(50); asm.db(0xAB) # GeneSense (50)
-    asm.mov_ax(0); asm.db(0xAB) # State (0=Idle)
+    asm.call('rand_x'); asm.stosw()
+    asm.call('rand_y'); asm.stosw()
+    asm.mov_ax(100); asm.stosw()  # Energy
+    asm.mov_ax(2); asm.stosw()  # Speed
+    asm.mov_ax(50); asm.stosw()  # Sense
+    asm.mov_ax(0); asm.stosw()  # Generation
     asm.dec_cx(); asm.jcxz('init_pred'); asm.jmp('init_prey_loop')
-    
+
     # Pred
     asm.label('init_pred')
     asm.mov_cx(NUM_PRED)
     asm.label('init_pred_loop')
-    asm.call('rand'); asm.db(0x25); asm.dw(300); asm.db(0x05); asm.dw(10); asm.db(0xAB)
-    asm.call('rand'); asm.db(0x25); asm.dw(180); asm.db(0x05); asm.dw(10); asm.db(0xAB)
-    asm.mov_ax(100); asm.db(0xAB)
-    asm.mov_ax(3); asm.db(0xAB) # Faster
-    asm.mov_ax(100); asm.db(0xAB) # Better Vision
-    asm.mov_ax(0); asm.db(0xAB)
+    asm.call('rand_x'); asm.stosw()
+    asm.call('rand_y'); asm.stosw()
+    asm.mov_ax(100); asm.stosw()
+    asm.mov_ax(3); asm.stosw()  # Faster
+    asm.mov_ax(100); asm.stosw()  # Better vision
+    asm.mov_ax(0); asm.stosw()
     asm.dec_cx(); asm.jcxz('init_done'); asm.jmp('init_pred_loop')
     asm.label('init_done'); asm.ret()
 
@@ -267,6 +441,7 @@ def build_kernel():
     asm.label('draw_pixel')
     asm.pusha()
     asm.db(0x06) # PUSH ES
+    asm.cmp_cx(0); asm.jl('draw_skip'); asm.cmp_dx(0); asm.jl('draw_skip')
     asm.cmp_cx(318); asm.jg('draw_skip'); asm.cmp_dx(198); asm.jg('draw_skip')
     asm.mov_ax(0xA000); asm.mov_es_ax()
     asm.db(0x89); asm.db(0xD0); asm.db(0xC1); asm.db(0xE0); asm.db(0x08)
@@ -277,11 +452,76 @@ def build_kernel():
     asm.db(0xAA); asm.db(0xAA); asm.db(0x81); asm.db(0xC7); asm.dw(318); asm.db(0xAA); asm.db(0xAA)
     asm.label('draw_skip'); asm.db(0x07); asm.popa(); asm.ret() # POP ES
 
+    # Keep the 2x2 sprites inside the 320x200 framebuffer.
+    asm.label('clamp_entity')
+    asm.db(b"\x8B\x04"); asm.cmp_ax(2); asm.jl('clamp_x_min')
+    asm.cmp_ax(316); asm.jle('clamp_y')
+    asm.mov_ax(316); asm.db(b"\x89\x04"); asm.jmp('clamp_y')
+    asm.label('clamp_x_min')
+    asm.mov_ax(2); asm.db(b"\x89\x04")
+    asm.label('clamp_y')
+    asm.db(b"\x8B\x44\x02"); asm.cmp_ax(2); asm.jl('clamp_y_min')
+    asm.cmp_ax(196); asm.jle('clamp_done')
+    asm.mov_ax(196); asm.db(b"\x89\x44\x02"); asm.jmp('clamp_done')
+    asm.label('clamp_y_min')
+    asm.mov_ax(2); asm.db(b"\x89\x44\x02")
+    asm.label('clamp_done'); asm.ret()
+
+    # Fixed-population asexual replacement. Vacated slots use an unbiased
+    # random living donor; successful foragers preserve their own lineage.
+    asm.label('rebirth_prey')
+    asm.pusha()
+    asm.db(b"\x89\xFD")  # MOV BP, DI (destination slot)
+    asm.call('rand_x'); asm.db(b"\x89\x46\x00")
+    asm.call('rand_y'); asm.db(b"\x89\x46\x02")
+    asm.mov_ax(100); asm.db(b"\x89\x46\x04")
+
+    asm.label('random_parent_retry')
+    asm.call('rand'); asm.and_ax(0x001F); asm.cmp_ax(NUM_PREY)
+    asm.jge('random_parent_retry')
+    asm.label('parent_index_ready')
+    asm.db(b"\x89\xC3\xC1\xE0\x03\xC1\xE3\x02\x01\xD8")  # AX=index*12
+    asm.mov_si(DATA_BASE + (NUM_FOOD * 6)); asm.db(b"\x01\xC6")
+    asm.jmp('inherit_genes')
+
+    asm.label('rebirth_self')
+    asm.pusha()
+    asm.db(b"\x89\xFD")
+    asm.call('rand_x'); asm.db(b"\x89\x46\x00")
+    asm.call('rand_y'); asm.db(b"\x89\x46\x02")
+    asm.mov_ax(100); asm.db(b"\x89\x46\x04")
+    asm.db(b"\x89\xEE")  # MOV SI, BP
+
+    asm.label('inherit_genes')
+
+    # Speed: inherit, then occasionally mutate within 1..4.
+    asm.db(b"\x8B\x5C\x06"); asm.call('rand'); asm.db(b"\xA8\x03")
+    asm.jne('speed_store'); asm.call('rand'); asm.db(b"\xA8\x01")
+    asm.je('speed_down')
+    asm.db(0x43); asm.cmp_bx(4); asm.jle('speed_store'); asm.mov_bx(4); asm.jmp('speed_store')
+    asm.label('speed_down')
+    asm.db(0x4B); asm.cmp_bx(1); asm.jge('speed_store'); asm.mov_bx(1)
+    asm.label('speed_store'); asm.db(b"\x89\x5E\x06")
+
+    # Sense: inherit, then occasionally mutate by eight pixels within 24..120.
+    asm.db(b"\x8B\x5C\x08"); asm.call('rand'); asm.db(b"\xA8\x03")
+    asm.jne('sense_store'); asm.call('rand'); asm.db(b"\xA8\x01")
+    asm.je('sense_down')
+    asm.db(b"\x83\xC3\x08"); asm.cmp_bx(120); asm.jle('sense_store')
+    asm.mov_bx(120); asm.jmp('sense_store')
+    asm.label('sense_down')
+    asm.db(b"\x83\xEB\x08"); asm.cmp_bx(24); asm.jge('sense_store'); asm.mov_bx(24)
+    asm.label('sense_store'); asm.db(b"\x89\x5E\x08")
+
+    asm.db(b"\x8B\x44\x0A"); asm.inc_ax(); asm.db(b"\x89\x46\x0A")
+    asm.mov_bx(DATA_BASE - 6); asm.db(b"\xFF\x07")  # births++
+    asm.popa(); asm.ret()
+
     # Update Food
     asm.label('update_food')
     asm.label('food_loop')
     asm.pusha()
-    asm.db(0xAD); asm.mov_bx(0); asm.db(0x89); asm.db(0xC3) 
+    asm.db(0xAD); asm.mov_bx(0); asm.db(0x89); asm.db(0xC3)
     asm.db(0xAD); asm.mov_dx(0); asm.db(0x89); asm.db(0xC2)
     asm.mov_cx(0); asm.db(0x89); asm.db(0xD9); asm.mov_bx(COLOR_FOOD); asm.call('draw_pixel')
     asm.popa()
@@ -289,159 +529,185 @@ def build_kernel():
     asm.dec_cx(); asm.jcxz('food_done'); asm.jmp('food_loop')
     asm.label('food_done'); asm.ret()
 
-    # Update Prey (Genetics + FSM)
+    # Update prey: circadian energy, predator sensing, bounded movement,
+    # resource consumption, and fixed-population evolutionary replacement.
     asm.label('update_prey')
     asm.label('prey_loop')
     asm.pusha()
-    
-    # Load Genes
-    # SI points to X. 
-    # [SI+6] = GeneSpeed, [SI+8] = GeneSense
-    
-    # FSM Check: Sleep?
-    # Check Night (Global DX from main loop? No, DX clobbered. Check Time again)
+
+    # Recompute day/night because drawing calls use DX.
     asm.pusha()
     asm.mov_bx(DATA_BASE - 4); asm.db(0x8B); asm.db(0x07); asm.db(0xA9); asm.dw(0x0100)
     asm.popa()
-    asm.je('prey_awake') # Day
-    # Night: Sleep (Don't move, Heal)
-    asm.db(0x83); asm.db(0x44); asm.db(0x04); asm.db(0x01) # ADD [SI+4], 1 (Energy)
+    asm.je('prey_awake')
+    # Night: sleep and recover, capped at the reproduction threshold.
+    asm.db(b"\x81\x7C\x04"); asm.dw(160); asm.jl('prey_night_heal')
     asm.jmp('prey_draw')
-    
+    asm.label('prey_night_heal')
+    asm.db(b"\x83\x44\x04\x01")
+    asm.jmp('prey_draw')
+
     asm.label('prey_awake')
-    # Flee Logic (Using GeneSense)
+    asm.db(b"\xFF\x4C\x04")  # metabolism: DEC word [SI+4]
+    asm.jne('prey_has_energy')
+    asm.db(b"\x89\xF7"); asm.call('rebirth_prey'); asm.jmp('prey_draw')
+
+    asm.label('prey_has_energy')
+    # Flee when any predator is inside the inherited sense radius.
     asm.mov_di(DATA_BASE + (NUM_FOOD * 6) + (NUM_PREY * ENT_SIZE))
     asm.mov_dx(NUM_PRED)
     asm.label('flee_scan')
-    # Calc Dist
-    asm.db(0x8B); asm.db(0x04); asm.db(0x2B); asm.db(0x05); asm.mov_bx(0); asm.db(0x89); asm.db(0xC3) # X diff
-    asm.db(0x8B); asm.db(0x44); asm.db(0x02); asm.db(0x2B); asm.db(0x45); asm.db(0x02); asm.mov_cx(0); asm.db(0x89); asm.db(0xC1) # Y diff
-    asm.cmp_bx(0); asm.jge('bx_p'); asm.db(0xF7); asm.db(0xDB); asm.label('bx_p')
-    asm.cmp_cx(0); asm.jge('cx_p'); asm.db(0xF7); asm.db(0xD9); asm.label('cx_p')
-    asm.db(0x01); asm.db(0xCB) # Dist
-    
-    # Compare with GeneSense [SI+8]
-    asm.db(0x3B); asm.db(0x5C); asm.db(0x08) # CMP BX, [SI+8]
-    asm.jl('flee_now')
-    
-    asm.db(0x83); asm.db(0xC7); asm.db(0x0C) # Next Pred (12 bytes)
+    asm.db(b"\x8B\x04\x2B\x05"); asm.cmp_ax(0); asm.jge('flee_x_pos')
+    asm.db(b"\xF7\xD8")
+    asm.label('flee_x_pos'); asm.db(b"\x89\xC3")
+    asm.db(b"\x8B\x44\x02\x2B\x45\x02"); asm.cmp_ax(0); asm.jge('flee_y_pos')
+    asm.db(b"\xF7\xD8")
+    asm.label('flee_y_pos'); asm.db(b"\x01\xC3")
+    asm.db(b"\x3B\x5C\x08"); asm.jle('flee_now')
+
+    asm.db(b"\x83\xC7\x0C")
     asm.dec_dx(); asm.cmp_dx(0); asm.je('flee_none'); asm.jmp('flee_scan')
-    
+
     asm.label('flee_now')
-    # Move Away (Using GeneSpeed [SI+6])
-    asm.db(0x8B); asm.db(0x5C); asm.db(0x06) # MOV BX, [SI+6] (Speed)
-    # Direction logic (Simplified)
-    asm.db(0x8B); asm.db(0x04); asm.db(0x2B); asm.db(0x05); asm.cmp_ax(0); asm.jge('f_r'); asm.db(0x01); asm.db(0x1C); asm.jmp('f_y'); asm.label('f_r'); asm.db(0x29); asm.db(0x1C)
-    asm.label('f_y')
-    asm.db(0x8B); asm.db(0x44); asm.db(0x02); asm.db(0x2B); asm.db(0x45); asm.db(0x02); asm.cmp_ax(0); asm.jge('f_d'); asm.db(0x01); asm.db(0x5C); asm.db(0x02); asm.jmp('prey_move_done'); asm.label('f_d'); asm.db(0x29); asm.db(0x5C); asm.db(0x02)
+    asm.db(b"\x8B\x5C\x06")
+    asm.db(b"\x8B\x04\x2B\x05"); asm.cmp_ax(0); asm.jge('flee_right')
+    asm.db(b"\x29\x1C"); asm.jmp('flee_vertical')
+    asm.label('flee_right'); asm.db(b"\x01\x1C")
+    asm.label('flee_vertical')
+    asm.db(b"\x8B\x44\x02\x2B\x45\x02"); asm.cmp_ax(0); asm.jge('flee_down')
+    asm.db(b"\x29\x5C\x02"); asm.jmp('prey_move_done')
+    asm.label('flee_down'); asm.db(b"\x01\x5C\x02")
     asm.jmp('prey_move_done')
-    
+
     asm.label('flee_none')
-    # Random Move (Speed)
-    asm.call('rand'); asm.db(0x25); asm.db(0x03); asm.db(0x00); asm.db(0x2D); asm.db(0x01); asm.db(0x00) # -1 to 1
-    # Multiply by Speed? Hard. Just add Speed.
-    asm.db(0x03); asm.db(0x44); asm.db(0x06) # ADD AX, [SI+6]
-    asm.db(0x01); asm.db(0x04) # Add to X
-    
-    asm.call('rand'); asm.db(0x25); asm.db(0x03); asm.db(0x00); asm.db(0x2D); asm.db(0x01); asm.db(0x00)
-    asm.db(0x03); asm.db(0x44); asm.db(0x06)
-    asm.db(0x01); asm.db(0x44); asm.db(0x02) # Add to Y
-    
+    # Symmetric random walk whose magnitude is the speed gene.
+    asm.db(b"\x8B\x5C\x06")
+    asm.call('rand'); asm.db(b"\xA8\x01"); asm.je('wander_x_minus')
+    asm.db(b"\x01\x1C"); asm.jmp('wander_y')
+    asm.label('wander_x_minus'); asm.db(b"\x29\x1C")
+    asm.label('wander_y')
+    asm.call('rand'); asm.db(b"\xA8\x01"); asm.je('wander_y_minus')
+    asm.db(b"\x01\x5C\x02"); asm.jmp('prey_move_done')
+    asm.label('wander_y_minus'); asm.db(b"\x29\x5C\x02")
+
     asm.label('prey_move_done')
-    
-    # Water Physics (Drag)
-    # If Y > 170, Speed = Speed / 2 (Simulated by skipping move every other frame? Too complex. Just subtract 1 from pos)
-    asm.db(0x83); asm.db(0x7C); asm.db(0x02); asm.db(0xAA) # CMP [SI+2], 170
+    asm.call('clamp_entity')
+
+    # Water creates a persistent upward drag below y=170.
+    asm.db(b"\x81\x7C\x02"); asm.dw(170)
     asm.jl('not_water')
-    asm.db(0xFF); asm.db(0x4C); asm.db(0x02) # DEC [SI+2] (Push back)
+    asm.db(b"\xFF\x4C\x02")
     asm.label('not_water')
-    
+
     # Eat Food
     asm.mov_di(DATA_BASE); asm.mov_dx(NUM_FOOD)
     asm.label('eat_loop')
-    # Collision Check (Inline)
-    asm.db(0x8B); asm.db(0x04); asm.db(0x2B); asm.db(0x05); asm.cmp_ax(0); asm.jge('dx_p'); asm.db(0xF7); asm.db(0xD8); asm.label('dx_p'); asm.cmp_ax(4); asm.jg('no_eat')
-    asm.db(0x8B); asm.db(0x44); asm.db(0x02); asm.db(0x2B); asm.db(0x45); asm.db(0x02); asm.cmp_ax(0); asm.jge('dy_p'); asm.db(0xF7); asm.db(0xD8); asm.label('dy_p'); asm.cmp_ax(4); asm.jg('no_eat')
-    # Ate
-    asm.call('rand'); asm.db(0x25); asm.dw(300); asm.db(0x05); asm.dw(10); asm.db(0x89); asm.db(0x05) # Respawn Food
-    asm.call('rand'); asm.db(0x25); asm.dw(180); asm.db(0x05); asm.dw(10); asm.db(0x89); asm.db(0x45); asm.db(0x02)
-    asm.db(0x83); asm.db(0x44); asm.db(0x04); asm.db(0x14) # Add 20 Energy
+    asm.db(b"\x8B\x04\x2B\x05"); asm.cmp_ax(0); asm.jge('eat_x_pos')
+    asm.db(b"\xF7\xD8")
+    asm.label('eat_x_pos'); asm.cmp_ax(4); asm.jg('no_eat')
+    asm.db(b"\x8B\x44\x02\x2B\x45\x02"); asm.cmp_ax(0); asm.jge('eat_y_pos')
+    asm.db(b"\xF7\xD8")
+    asm.label('eat_y_pos'); asm.cmp_ax(4); asm.jg('no_eat')
+
+    asm.call('rand_x'); asm.db(b"\x89\x05")
+    asm.call('rand_y'); asm.db(b"\x89\x45\x02")
+    asm.db(b"\x83\x44\x04\x14")
+    asm.db(b"\x81\x7C\x04"); asm.dw(160); asm.jl('prey_ate')
+    asm.db(b"\x89\xF7"); asm.call('rebirth_self')
+    asm.label('prey_ate')
     asm.mov_bx(0x0F); asm.jmp('prey_draw_c')
     asm.label('no_eat')
-    asm.db(0x83); asm.db(0xC7); asm.db(0x06); asm.dec_dx(); asm.cmp_dx(0); asm.je('eat_done'); asm.jmp('eat_loop')
+    asm.db(b"\x83\xC7\x06"); asm.dec_dx(); asm.cmp_dx(0); asm.je('eat_done'); asm.jmp('eat_loop')
     asm.label('eat_done')
-    
-    asm.mov_bx(COLOR_PREY)
+
     asm.label('prey_draw')
+    asm.mov_bx(COLOR_PREY)
     asm.label('prey_draw_c')
-    asm.db(0x8B); asm.db(0x0C); asm.db(0x8B); asm.db(0x54); asm.db(0x02); asm.call('draw_pixel')
-    
+    asm.db(b"\x8B\x0C\x8B\x54\x02"); asm.call('draw_pixel')
+
     asm.popa()
-    asm.db(0x83); asm.db(0xC6); asm.db(0x0C) # Next Prey (12 bytes)
+    asm.db(b"\x83\xC6\x0C")
     asm.dec_cx(); asm.jcxz('prey_done'); asm.jmp('prey_loop')
     asm.label('prey_done'); asm.ret()
 
-    # Update Pred (Chase)
+    # Update predators: nearest-target pursuit, gene-scaled movement, predation.
     asm.label('update_pred')
     asm.label('pred_loop')
     asm.pusha()
-    
-    # Chase Logic (Find closest Prey)
+
     asm.mov_di(DATA_BASE + (NUM_FOOD * 6))
     asm.mov_dx(NUM_PREY)
-    asm.mov_bp(0x7FFF) # Min Dist
-    asm.mov_bx(0) # Target
-    
+    asm.mov_bx(DATA_BASE - 12); asm.mov_ax(0x7FFF); asm.db(b"\x89\x07")
+    asm.mov_bx(DATA_BASE - 10); asm.xor_ax_ax(); asm.db(b"\x89\x07")
+
     asm.label('chase_scan')
-    asm.db(0x8B); asm.db(0x04); asm.db(0x2B); asm.db(0x05); asm.cmp_ax(0); asm.jge('pdx_p'); asm.db(0xF7); asm.db(0xD8); asm.label('pdx_p'); asm.pusha(); asm.mov_bx(0); asm.db(0x89); asm.db(0xC3)
-    asm.db(0x8B); asm.db(0x44); asm.db(0x02); asm.db(0x2B); asm.db(0x45); asm.db(0x02); asm.cmp_ax(0); asm.jge('pdy_p'); asm.db(0xF7); asm.db(0xD8); asm.label('pdy_p')
-    asm.db(0x01); asm.db(0xD8) # Dist
-    asm.db(0x39); asm.db(0xE8) # CMP AX, BP
+    asm.db(b"\x8B\x04\x2B\x05"); asm.cmp_ax(0); asm.jge('chase_x_pos')
+    asm.db(b"\xF7\xD8")
+    asm.label('chase_x_pos'); asm.db(b"\x89\xC3")
+    asm.db(b"\x8B\x44\x02\x2B\x45\x02"); asm.cmp_ax(0); asm.jge('chase_y_pos')
+    asm.db(b"\xF7\xD8")
+    asm.label('chase_y_pos'); asm.db(b"\x01\xD8")
+    asm.mov_bx(DATA_BASE - 12); asm.db(b"\x3B\x07")
     asm.jge('not_closer')
-    asm.db(0x89); asm.db(0xC5) # MOV BP, AX
-    asm.db(0x89); asm.db(0x3E); asm.dw(DATA_BASE - 10) # Save Target DI
+    asm.db(b"\x89\x07")
+    asm.mov_bx(DATA_BASE - 10); asm.db(b"\x89\x3F")
     asm.label('not_closer')
-    asm.popa()
-    asm.db(0x83); asm.db(0xC7); asm.db(0x0C); asm.dec_dx(); asm.cmp_dx(0); asm.je('chase_done'); asm.jmp('chase_scan')
-    
+    asm.db(b"\x83\xC7\x0C"); asm.dec_dx(); asm.cmp_dx(0)
+    asm.je('chase_done'); asm.jmp('chase_scan')
+
     asm.label('chase_done')
-    # Check Vision [SI+8]
-    asm.db(0x3B); asm.db(0x6C); asm.db(0x08) # CMP BP, [SI+8]
+    asm.mov_bx(DATA_BASE - 12); asm.db(b"\x8B\x07\x3B\x44\x08")
     asm.jg('chase_none')
-    
-    # Move to Target
-    asm.db(0x8B); asm.db(0x3E); asm.dw(DATA_BASE - 10) # MOV DI, Target
-    # X
-    asm.db(0x8B); asm.db(0x04); asm.db(0x2B); asm.db(0x05); asm.cmp_ax(0); asm.je('c_y'); asm.jg('c_l'); asm.db(0xFF); asm.db(0x04); asm.jmp('c_y'); asm.label('c_l'); asm.db(0xFF); asm.db(0x0C)
-    asm.label('c_y')
-    asm.db(0x8B); asm.db(0x44); asm.db(0x02); asm.db(0x2B); asm.db(0x45); asm.db(0x02); asm.cmp_ax(0); asm.je('c_done'); asm.jg('c_u'); asm.db(0xFF); asm.db(0x44); asm.db(0x02); asm.jmp('c_done'); asm.label('c_u'); asm.db(0xFF); asm.db(0x4C); asm.db(0x02)
-    asm.jmp('c_done')
-    
+
+    asm.mov_bx(DATA_BASE - 10); asm.db(b"\x8B\x3F")
+    asm.db(b"\x8B\x5C\x06")
+    asm.db(b"\x8B\x04\x2B\x05"); asm.cmp_ax(0); asm.je('chase_vertical')
+    asm.jg('chase_left')
+    asm.db(b"\x01\x1C"); asm.jmp('chase_vertical')
+    asm.label('chase_left'); asm.db(b"\x29\x1C")
+    asm.label('chase_vertical')
+    asm.db(b"\x8B\x44\x02\x2B\x45\x02"); asm.cmp_ax(0); asm.je('pred_move_done')
+    asm.jg('chase_up')
+    asm.db(b"\x01\x5C\x02"); asm.jmp('pred_move_done')
+    asm.label('chase_up'); asm.db(b"\x29\x5C\x02")
+    asm.jmp('pred_move_done')
+
     asm.label('chase_none')
-    asm.call('rand'); asm.db(0x25); asm.db(0x03); asm.db(0x00); asm.db(0x2D); asm.db(0x01); asm.db(0x00); asm.db(0x01); asm.db(0x04)
-    asm.call('rand'); asm.db(0x25); asm.db(0x03); asm.db(0x00); asm.db(0x2D); asm.db(0x01); asm.db(0x00); asm.db(0x01); asm.db(0x44); asm.db(0x02)
-    
-    asm.label('c_done')
-    
+    asm.db(b"\x8B\x5C\x06")
+    asm.call('rand'); asm.db(b"\xA8\x01"); asm.je('pred_x_minus')
+    asm.db(b"\x01\x1C"); asm.jmp('pred_wander_y')
+    asm.label('pred_x_minus'); asm.db(b"\x29\x1C")
+    asm.label('pred_wander_y')
+    asm.call('rand'); asm.db(b"\xA8\x01"); asm.je('pred_y_minus')
+    asm.db(b"\x01\x5C\x02"); asm.jmp('pred_move_done')
+    asm.label('pred_y_minus'); asm.db(b"\x29\x5C\x02")
+
+    asm.label('pred_move_done')
+    asm.call('clamp_entity')
+
     # Eat Prey
     asm.mov_di(DATA_BASE + (NUM_FOOD * 6)); asm.mov_dx(NUM_PREY)
     asm.label('kill_loop')
-    asm.db(0x8B); asm.db(0x04); asm.db(0x2B); asm.db(0x05); asm.cmp_ax(0); asm.jge('kdx_p'); asm.db(0xF7); asm.db(0xD8); asm.label('kdx_p'); asm.cmp_ax(4); asm.jg('no_kill')
-    asm.db(0x8B); asm.db(0x44); asm.db(0x02); asm.db(0x2B); asm.db(0x45); asm.db(0x02); asm.cmp_ax(0); asm.jge('kdy_p'); asm.db(0xF7); asm.db(0xD8); asm.label('kdy_p'); asm.cmp_ax(4); asm.jg('no_kill')
-    # Kill
-    asm.call('rand'); asm.db(0x25); asm.dw(300); asm.db(0x05); asm.dw(10); asm.db(0x89); asm.db(0x05)
-    asm.call('rand'); asm.db(0x25); asm.dw(180); asm.db(0x05); asm.dw(10); asm.db(0x89); asm.db(0x45); asm.db(0x02)
-    asm.mov_bx(0x28); asm.jmp('pred_draw_c')
+    asm.db(b"\x8B\x04\x2B\x05"); asm.cmp_ax(0); asm.jge('kill_x_pos')
+    asm.db(b"\xF7\xD8")
+    asm.label('kill_x_pos'); asm.cmp_ax(4); asm.jg('no_kill')
+    asm.db(b"\x8B\x44\x02\x2B\x45\x02"); asm.cmp_ax(0); asm.jge('kill_y_pos')
+    asm.db(b"\xF7\xD8")
+    asm.label('kill_y_pos'); asm.cmp_ax(4); asm.jg('no_kill')
+
+    asm.call('rebirth_prey')
+    asm.mov_bx(DATA_BASE - 8); asm.db(b"\xFF\x07")  # kills++
+    asm.mov_bx(0x0F); asm.jmp('pred_draw_c')
     asm.label('no_kill')
-    asm.db(0x83); asm.db(0xC7); asm.db(0x0C); asm.dec_dx(); asm.cmp_dx(0); asm.je('kill_done'); asm.jmp('kill_loop')
+    asm.db(b"\x83\xC7\x0C"); asm.dec_dx(); asm.cmp_dx(0); asm.je('kill_done'); asm.jmp('kill_loop')
     asm.label('kill_done')
-    
+
     asm.mov_bx(COLOR_PRED)
     asm.label('pred_draw_c')
-    asm.db(0x8B); asm.db(0x0C); asm.db(0x8B); asm.db(0x54); asm.db(0x02); asm.call('draw_pixel')
-    
+    asm.db(b"\x8B\x0C\x8B\x54\x02"); asm.call('draw_pixel')
+
     asm.popa()
-    asm.db(0x83); asm.db(0xC6); asm.db(0x0C)
+    asm.db(b"\x83\xC6\x0C")
     asm.dec_cx(); asm.jcxz('pred_done'); asm.jmp('pred_loop')
     asm.label('pred_done'); asm.ret()
 
@@ -449,92 +715,315 @@ def build_kernel():
     asm.label('delay')
     asm.mov_cx(5000); asm.label('d1'); asm.pusha(); asm.mov_cx(100); asm.label('d2'); asm.nop(); asm.dec_cx(); asm.jcxz('d2_d'); asm.jmp('d2'); asm.label('d2_d'); asm.popa(); asm.dec_cx(); asm.jcxz('d1_d'); asm.jmp('d1'); asm.label('d1_d'); asm.ret()
 
-    return asm.resolve()
+    return asm.image()
 
-def create_floppy_img(boot_bin, kernel_bin, floppy_path):
-    FLOPPY_SIZE = 1474560
+def build_kernel(seed: int = DEFAULT_SEED) -> bytes:
+    return assemble_kernel(seed).code
+
+
+def make_floppy_image(boot_bin: bytes, kernel_bin: bytes) -> bytes:
+    if len(boot_bin) != SECTOR_SIZE or boot_bin[-2:] != b"\x55\xAA":
+        raise BuildError("Boot image must be one 512-byte sector ending in 0x55AA")
+    kernel_sectors = (len(kernel_bin) + SECTOR_SIZE - 1) // SECTOR_SIZE
+    if not 1 <= kernel_sectors <= MAX_KERNEL_SECTORS:
+        raise BuildError(
+            f"Kernel requires {kernel_sectors} sectors; maximum is {MAX_KERNEL_SECTORS}"
+        )
+    if SECTOR_SIZE + len(kernel_bin) > FLOPPY_SIZE:
+        raise BuildError("Kernel does not fit in the floppy image")
+
     image = bytearray(FLOPPY_SIZE)
-    image[:512] = boot_bin
-    k_len = len(kernel_bin)
-    image[512:512+k_len] = kernel_bin
-    with open(floppy_path, 'wb') as f: f.write(image)
+    image[:SECTOR_SIZE] = boot_bin
+    image[SECTOR_SIZE:SECTOR_SIZE + len(kernel_bin)] = kernel_bin
+    return bytes(image)
+
+
+def create_floppy_img(boot_bin: bytes, kernel_bin: bytes, floppy_path) -> bool:
+    Path(floppy_path).write_bytes(make_floppy_image(boot_bin, kernel_bin))
     return True
 
-def create_iso(floppy_img_path, iso_path):
-    SECTOR_SIZE = 2048
-    try:
-        with open(floppy_img_path, 'rb') as f: floppy_data = f.read()
-    except FileNotFoundError: return
-    floppy_sectors_count = (len(floppy_data) + SECTOR_SIZE - 1) // SECTOR_SIZE
-    sectors = [b'\x00' * SECTOR_SIZE] * 16 
-    pvd = bytearray(b'\x00' * SECTOR_SIZE)
-    pvd[0] = 1; pvd[1:6] = b'CD001'; pvd[6] = 1; pvd[40:72] = b'EVOSIM_RETRO'.ljust(32, b' ')
-    boot_catalog_lba = 19
-    boot_image_lba = 20
-    next_free_lba = boot_image_lba + floppy_sectors_count
-    root_lba = next_free_lba
-    root_record = bytearray(34)
-    root_record[0] = 34; root_record[1] = 0
-    struct.pack_into('<I', root_record, 2, root_lba)
-    struct.pack_into('>I', root_record, 6, root_lba)
-    struct.pack_into('<I', root_record, 10, SECTOR_SIZE)
-    struct.pack_into('>I', root_record, 14, SECTOR_SIZE)
-    root_record[25] = 2; root_record[32] = 1; root_record[33] = 0
+
+def _both_endian16(value: int) -> bytes:
+    return struct.pack("<H", value) + struct.pack(">H", value)
+
+
+def _both_endian32(value: int) -> bytes:
+    return struct.pack("<I", value) + struct.pack(">I", value)
+
+
+def _directory_record(
+    identifier: bytes,
+    extent_lba: int,
+    data_length: int,
+    *,
+    directory: bool = False,
+) -> bytes:
+    if not 1 <= len(identifier) <= 255:
+        raise BuildError("ISO9660 identifiers must contain 1..255 bytes")
+    padding = b"\x00" if len(identifier) % 2 == 0 else b""
+    record = bytearray(33 + len(identifier) + len(padding))
+    record[0] = len(record)
+    record[2:10] = _both_endian32(extent_lba)
+    record[10:18] = _both_endian32(data_length)
+    record[18:25] = bytes((126, 1, 1, 0, 0, 0, 0))  # 2026-01-01 UTC
+    record[25] = 0x02 if directory else 0
+    record[28:32] = _both_endian16(1)
+    record[32] = len(identifier)
+    record[33:33 + len(identifier)] = identifier
+    return bytes(record)
+
+
+def _path_table(root_lba: int, byte_order: str) -> bytes:
+    if byte_order == "little":
+        prefix = struct.pack("<BBIH", 1, 0, root_lba, 1)
+    elif byte_order == "big":
+        prefix = struct.pack(">BBIH", 1, 0, root_lba, 1)
+    else:
+        raise BuildError(f"Unsupported path-table byte order: {byte_order}")
+    return prefix + b"\x00\x00"
+
+
+def _iso_readme() -> bytes:
+    return (
+        "ENVO AGENT OS - RETRO ARTIFICIAL LIFE EDITION\r\n"
+        f"Version {VERSION}\r\n\r\n"
+        "Boot with an x86 BIOS emulator. Controls: P pauses; R restarts.\r\n"
+        "Green prey forage and inherit speed/sense traits; red predators hunt.\r\n"
+        "Builds are deterministic for a fixed --seed value.\r\n"
+        "Project: https://github.com/kai9987kai/Envo-agent-os\r\n"
+    ).encode("ascii")
+
+
+def make_iso_image(floppy_data: bytes) -> bytes:
+    """Create a mountable ISO9660 + El Torito floppy-emulation image."""
+    if len(floppy_data) != FLOPPY_SIZE:
+        raise BuildError(f"El Torito floppy must be {FLOPPY_SIZE} bytes")
+    if floppy_data[510:512] != b"\x55\xAA":
+        raise BuildError("El Torito boot image is missing its boot signature")
+
+    pvd_lba = 16
+    boot_record_lba = 17
+    terminator_lba = 18
+    path_l_lba = 19
+    path_m_lba = 20
+    root_lba = 21
+    boot_catalog_lba = 22
+    boot_image_lba = 23
+    floppy_blocks = (len(floppy_data) + ISO_SECTOR_SIZE - 1) // ISO_SECTOR_SIZE
+    readme_data = _iso_readme()
+    readme_lba = boot_image_lba + floppy_blocks
+    readme_blocks = (len(readme_data) + ISO_SECTOR_SIZE - 1) // ISO_SECTOR_SIZE
+    volume_space_size = readme_lba + readme_blocks
+
+    sectors = [bytearray(ISO_SECTOR_SIZE) for _ in range(volume_space_size)]
+    root_record = _directory_record(
+        b"\x00", root_lba, ISO_SECTOR_SIZE, directory=True
+    )
+    path_l = _path_table(root_lba, "little")
+    path_m = _path_table(root_lba, "big")
+
+    pvd = sectors[pvd_lba]
+    pvd[0] = 1
+    pvd[1:6] = b"CD001"
+    pvd[6] = 1
+    pvd[8:40] = b"ENVO AGENT OS".ljust(32, b" ")
+    pvd[40:72] = b"ENVO_AGENT_OS".ljust(32, b" ")
+    pvd[80:88] = _both_endian32(volume_space_size)
+    pvd[120:124] = _both_endian16(1)
+    pvd[124:128] = _both_endian16(1)
+    pvd[128:132] = _both_endian16(ISO_SECTOR_SIZE)
+    pvd[132:140] = _both_endian32(len(path_l))
+    pvd[140:144] = struct.pack("<I", path_l_lba)
+    pvd[148:152] = struct.pack(">I", path_m_lba)
     pvd[156:190] = root_record
-    sectors.append(pvd) 
-    brvd = bytearray(b'\x00' * SECTOR_SIZE)
-    brvd[0] = 0; brvd[1:6] = b'CD001'; brvd[6] = 1
-    brvd[7:39] = b'EL TORITO SPECIFICATION'.ljust(32, b'\x00')
-    brvd[71:75] = struct.pack('<I', boot_catalog_lba) 
-    sectors.append(brvd) 
-    term = bytearray(b'\x00' * SECTOR_SIZE)
-    term[0] = 255; term[1:6] = b'CD001'; term[6] = 1
-    sectors.append(term) 
-    catalog = bytearray(b'\x00' * SECTOR_SIZE)
-    catalog[0] = 1; catalog[1] = 0
-    catalog[30] = 0x55; catalog[31] = 0xAA
-    checksum = 0
-    for i in range(0, 32, 2):
-        if i == 28: continue
-        val = struct.unpack_from('<H', catalog, i)[0]
-        checksum = (checksum + val) & 0xFFFF
-    checksum = (-checksum) & 0xFFFF
-    struct.pack_into('<H', catalog, 28, checksum)
-    catalog[32] = 0x88; catalog[33] = 0x02 
-    catalog[34:36] = b'\x00\x00'; catalog[36] = 0; catalog[37] = 0
-    catalog[38:40] = struct.pack('<H', 1)
-    catalog[40:44] = struct.pack('<I', boot_image_lba)
-    sectors.append(catalog) 
-    for i in range(0, len(floppy_data), SECTOR_SIZE):
-        chunk = floppy_data[i:i+SECTOR_SIZE]
-        if len(chunk) < SECTOR_SIZE: chunk = chunk.ljust(SECTOR_SIZE, b'\x00')
-        sectors.append(chunk)
-    root_dir = bytearray(b'\x00' * SECTOR_SIZE)
-    root_dir[0] = 34
-    struct.pack_into('<I', root_dir, 2, root_lba)
-    struct.pack_into('>I', root_dir, 6, root_lba)
-    struct.pack_into('<I', root_dir, 10, SECTOR_SIZE)
-    struct.pack_into('>I', root_dir, 14, SECTOR_SIZE)
-    root_dir[25] = 2; root_dir[32] = 1; root_dir[33] = 0
-    offset = 34
-    root_dir[offset] = 34
-    struct.pack_into('<I', root_dir, offset+2, root_lba)
-    struct.pack_into('>I', root_dir, offset+6, root_lba)
-    struct.pack_into('<I', root_dir, offset+10, SECTOR_SIZE)
-    struct.pack_into('>I', root_dir, offset+14, SECTOR_SIZE)
-    root_dir[offset+25] = 2; root_dir[offset+32] = 1; root_dir[offset+33] = 1
-    sectors.append(root_dir)
-    with open(iso_path, 'wb') as f:
-        for sector in sectors: f.write(sector)
-    print(f"Successfully created {iso_path}")
+    pvd[574:702] = b"ENVO AGENT OS PYTHON BUILDER".ljust(128, b" ")
+    pvd[702:739] = b"CREATE_ISO.PY".ljust(37, b" ")
+    pvd[739:776] = b"ENVO AGENT OS".ljust(37, b" ")
+    iso_timestamp = b"2026010100000000\x00"
+    pvd[813:830] = iso_timestamp
+    pvd[830:847] = iso_timestamp
+    pvd[881] = 1
+
+    boot_record = sectors[boot_record_lba]
+    boot_record[0] = 0
+    boot_record[1:6] = b"CD001"
+    boot_record[6] = 1
+    boot_record[7:39] = b"EL TORITO SPECIFICATION".ljust(32, b"\x00")
+    boot_record[71:75] = struct.pack("<I", boot_catalog_lba)
+
+    terminator = sectors[terminator_lba]
+    terminator[0] = 255
+    terminator[1:6] = b"CD001"
+    terminator[6] = 1
+
+    sectors[path_l_lba][:len(path_l)] = path_l
+    sectors[path_m_lba][:len(path_m)] = path_m
+
+    root_entries = (
+        root_record,
+        _directory_record(b"\x01", root_lba, ISO_SECTOR_SIZE, directory=True),
+        _directory_record(b"BOOT.CAT;1", boot_catalog_lba, ISO_SECTOR_SIZE),
+        _directory_record(b"BOOT.IMG;1", boot_image_lba, len(floppy_data)),
+        _directory_record(b"README.TXT;1", readme_lba, len(readme_data)),
+    )
+    root_data = b"".join(root_entries)
+    sectors[root_lba][:len(root_data)] = root_data
+
+    catalog = sectors[boot_catalog_lba]
+    catalog[0] = 1
+    catalog[1] = 0  # x86 platform
+    catalog[4:28] = b"ENVO AGENT OS".ljust(24, b"\x00")
+    catalog[30:32] = b"\x55\xAA"
+    checksum = -sum(struct.unpack("<16H", bytes(catalog[:32]))) & 0xFFFF
+    struct.pack_into("<H", catalog, 28, checksum)
+    catalog[32] = 0x88  # bootable
+    catalog[33] = 0x02  # 1.44 MB floppy emulation
+    struct.pack_into("<H", catalog, 38, 1)
+    struct.pack_into("<I", catalog, 40, boot_image_lba)
+
+    for block_index in range(floppy_blocks):
+        start = block_index * ISO_SECTOR_SIZE
+        chunk = floppy_data[start:start + ISO_SECTOR_SIZE]
+        sectors[boot_image_lba + block_index][:len(chunk)] = chunk
+    sectors[readme_lba][:len(readme_data)] = readme_data
+
+    image = b"".join(bytes(sector) for sector in sectors)
+    if len(image) != volume_space_size * ISO_SECTOR_SIZE:
+        raise BuildError("ISO size invariant failed")
+    return image
+
+def create_iso(floppy_img_path, iso_path) -> bool:
+    Path(iso_path).write_bytes(make_iso_image(Path(floppy_img_path).read_bytes()))
+    return True
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def build_artifacts(seed: int = DEFAULT_SEED) -> BuildArtifacts:
+    kernel = build_kernel(seed)
+    kernel_sectors = (len(kernel) + SECTOR_SIZE - 1) // SECTOR_SIZE
+    boot = build_bootloader(kernel_sectors)
+    floppy = make_floppy_image(boot, kernel)
+    iso = make_iso_image(floppy)
+
+    entries = {
+        "boot.bin": boot,
+        "kernel.bin": kernel,
+        "floppy.img": floppy,
+        "os.iso": iso,
+    }
+    manifest_object = {
+        "artifacts": {
+            name: {"bytes": len(data), "sha256": _sha256(data)}
+            for name, data in entries.items()
+        },
+        "format_version": 1,
+        "kernel_load_address": f"0x{KERNEL_LOAD_ADDR:04X}",
+        "kernel_sectors": kernel_sectors,
+        "project": "Envo Agent OS",
+        "seed": seed,
+        "version": VERSION,
+    }
+    manifest = (
+        json.dumps(manifest_object, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    return BuildArtifacts(boot, kernel, floppy, iso, manifest)
+
+
+def _artifact_entries(artifacts: BuildArtifacts) -> dict[str, bytes]:
+    return {
+        "boot.bin": artifacts.boot,
+        "kernel.bin": artifacts.kernel,
+        "floppy.img": artifacts.floppy,
+        "os.iso": artifacts.iso,
+        "build-manifest.json": artifacts.manifest,
+    }
+
+
+def write_artifacts(artifacts: BuildArtifacts, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name, data in _artifact_entries(artifacts).items():
+        destination = output_dir / name
+        temporary = output_dir / f".{name}.tmp"
+        temporary.write_bytes(data)
+        temporary.replace(destination)
+
+
+def check_artifacts(artifacts: BuildArtifacts, output_dir: Path) -> list[str]:
+    mismatches = []
+    for name, expected in _artifact_entries(artifacts).items():
+        path = output_dir / name
+        if not path.is_file():
+            mismatches.append(f"{name}: missing")
+        elif path.read_bytes() != expected:
+            mismatches.append(f"{name}: differs from reproducible build")
+    return mismatches
+
+
+def _parse_seed(value: str) -> int:
+    try:
+        seed = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "seed must be an integer (decimal or 0xHEX)"
+        ) from exc
+    if not 1 <= seed <= 0xFFFF:
+        raise argparse.ArgumentTypeError("seed must be in the range 1..65535")
+    return seed
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Build deterministic Envo Agent OS boot media."
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent,
+        help="artifact directory (default: repository directory)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=_parse_seed,
+        default=DEFAULT_SEED,
+        help=f"non-zero 16-bit simulation seed (default: 0x{DEFAULT_SEED:04X})",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="verify existing artifacts instead of writing them",
+    )
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        artifacts = build_artifacts(args.seed)
+        output_dir = args.output_dir.resolve()
+        if args.check:
+            mismatches = check_artifacts(artifacts, output_dir)
+            if mismatches:
+                for mismatch in mismatches:
+                    print(f"ERROR: {mismatch}")
+                return 1
+            print(f"Artifacts verified in {output_dir}")
+            return 0
+
+        write_artifacts(artifacts, output_dir)
+        manifest = json.loads(artifacts.manifest)
+        print(
+            f"Built Envo Agent OS {VERSION}: "
+            f"{len(artifacts.kernel)}-byte kernel in "
+            f"{manifest['kernel_sectors']} sector(s)"
+        )
+        print(f"Artifacts written to {output_dir}")
+        return 0
+    except (BuildError, OSError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
 
 if __name__ == "__main__":
-    print("Building Bootloader...")
-    boot_bin = build_bootloader()
-    print("Building Kernel...")
-    kernel_bin = build_kernel()
-    print(f"Kernel Size: {len(kernel_bin)} bytes")
-    print("Creating Floppy Image...")
-    create_floppy_img(boot_bin, kernel_bin, "floppy.img")
-    print("Creating ISO...")
-    create_iso("floppy.img", "os.iso")
+    raise SystemExit(main())
