@@ -105,9 +105,9 @@ jobs:
           from envo_reference import ReferenceModel
           from envo_telemetry import (
               load_experiment_config_id,
-              parse_frames,
               verify_config_id,
           )
+          from run_experiment import validate_trace_sequence
 
           experiment_path = Path("build/experiment.json")
           config = load_model_config(experiment_path)
@@ -133,13 +133,15 @@ jobs:
                   )
 
               # QEMU is deliberately terminated at the timeout, so its final
-              # frame may be partial. Lenient extraction ignores only that
-              # trailing fragment/corrupt candidates; every returned frame
-              # has passed the protocol header and checksum validation.
-              frames = parse_frames(telemetry, strict=False)
+              # frame may be partial. All complete frames must remain aligned,
+              # checksummed, and gap-free from the first configured tick.
+              frames = validate_trace_sequence(
+                  telemetry,
+                  config.telemetry_interval,
+              )
               if not frames:
                   raise SystemExit(
-                      f"{label}: no valid v2 telemetry frame; "
+                      f"{label}: no valid v3 telemetry frame; "
                       f"telemetry={telemetry.hex()}"
                   )
               verify_config_id(frames, expected_config_id)
@@ -155,6 +157,12 @@ jobs:
                       + frame.speed_3_count
                       + frame.speed_4_count
                   )
+                  predator_speed_total = (
+                      frame.predator_speed_1_count
+                      + frame.predator_speed_2_count
+                      + frame.predator_speed_3_count
+                      + frame.predator_speed_4_count
+                  )
                   if frame.tick & (config.telemetry_interval - 1):
                       raise SystemExit(
                           f"{label}: frame {index} tick {frame.tick} is not "
@@ -164,6 +172,12 @@ jobs:
                       raise SystemExit(
                           f"{label}: frame {index} speed bins total "
                           f"{speed_total}, expected {config.prey_count}"
+                      )
+                  if predator_speed_total != config.predator_count:
+                      raise SystemExit(
+                          f"{label}: frame {index} predator speed bins total "
+                          f"{predator_speed_total}, expected "
+                          f"{config.predator_count}"
                       )
                   if not (
                       config.sense_min * config.prey_count
@@ -175,6 +189,16 @@ jobs:
                           f"{frame.prey_sense_sum} is outside configured bounds"
                       )
                   if not (
+                      config.sense_min * config.predator_count
+                      <= frame.predator_sense_sum
+                      <= config.sense_max * config.predator_count
+                  ):
+                      raise SystemExit(
+                          f"{label}: frame {index} predator sense sum "
+                          f"{frame.predator_sense_sum} is outside configured "
+                          "bounds"
+                      )
+                  if not (
                       0
                       < frame.prey_energy_sum
                       <= config.reproduction_energy * config.prey_count
@@ -182,6 +206,18 @@ jobs:
                       raise SystemExit(
                           f"{label}: frame {index} prey energy sum "
                           f"{frame.prey_energy_sum} is outside model bounds"
+                      )
+                  if not (
+                      0
+                      < frame.predator_energy_sum
+                      <= (
+                          config.predator_reproduction_energy
+                          * config.predator_count
+                      )
+                  ):
+                      raise SystemExit(
+                          f"{label}: frame {index} predator energy sum "
+                          f"{frame.predator_energy_sum} is outside model bounds"
                       )
                   event_replacements = (
                       frame.captures
@@ -199,6 +235,29 @@ jobs:
                           f"{frame.max_generation} exceeds replacement count "
                           f"{frame.replacements}"
                       )
+                  predator_event_replacements = (
+                      frame.predator_starvations
+                      + frame.predator_forager_turnovers
+                  ) & 0xFFFF
+                  if (
+                      frame.predator_replacements
+                      != predator_event_replacements
+                  ):
+                      raise SystemExit(
+                          f"{label}: frame {index} predator replacement "
+                          "accounting does not match starvation/turnover "
+                          "counters"
+                      )
+                  if (
+                      frame.predator_max_generation
+                      > frame.predator_replacements
+                  ):
+                      raise SystemExit(
+                          f"{label}: frame {index} predator generation "
+                          f"{frame.predator_max_generation} exceeds "
+                          "replacement count "
+                          f"{frame.predator_replacements}"
+                      )
                   if reference_by_tick.get(frame.tick) != frame:
                       raise SystemExit(
                           f"{label}: frame {index} differs from the exact "
@@ -213,6 +272,11 @@ jobs:
                               f"{label}: frame {index} tick step {tick_step}, "
                               f"expected {config.telemetry_interval}"
                           )
+                  elif frame.tick != config.telemetry_interval:
+                      raise SystemExit(
+                          f"{label}: first frame tick {frame.tick}, expected "
+                          f"{config.telemetry_interval}"
+                      )
 
               traces[label] = frames
               print(
@@ -246,5 +310,98 @@ jobs:
           print(
               f"floppy/ISO deterministic prefix: {common_frames} "
               "checksummed frames"
+          )
+          PY
+
+      - name: Differentially boot a non-default event-path experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from dataclasses import replace
+          from pathlib import Path
+
+          from create_iso import VERSION
+          from envo_config import ModelConfig, build_experiment_document
+
+          config = replace(
+              ModelConfig(),
+              seed=1,
+              food_count=12,
+              prey_count=3,
+              predator_count=3,
+              initial_energy=20,
+              reproduction_energy=60,
+              predator_reproduction_energy=60,
+              mutation_mask=1,
+              sense_mutation_step=127,
+              day_night_mask=1,
+              waterline=2,
+              telemetry_interval=4,
+              prey_base_metabolism=2,
+              predator_base_metabolism=2,
+              speed_metabolism=2,
+              sense_metabolism_shift=4,
+          )
+          Path("build-custom-config.json").write_bytes(
+              build_experiment_document(config, VERSION)
+          )
+          PY
+
+          python create_iso.py \
+            --config build-custom-config.json \
+            --output-dir build-custom
+          python run_experiment.py \
+            build-custom/floppy.img \
+            --media-type floppy \
+            --experiment build-custom/experiment.json \
+            --output build-custom/telemetry.bin \
+            --json-out build-custom/summary.json \
+            --frames 3 \
+            --timeout 20 \
+            --qemu qemu-system-i386
+
+          python - <<'PY'
+          from pathlib import Path
+
+          from envo_config import load_model_config
+          from envo_reference import ReferenceModel
+          from run_experiment import validate_trace_sequence
+
+          config = load_model_config(Path("build-custom/experiment.json"))
+          trace = Path("build-custom/telemetry.bin").read_bytes()
+          frames = validate_trace_sequence(trace, config.telemetry_interval)
+          reference_by_tick = {
+              frame.tick: frame
+              for frame in ReferenceModel(config).run(frames[-1].tick)
+          }
+          for index, frame in enumerate(frames):
+              expected = reference_by_tick.get(frame.tick)
+              if frame != expected:
+                  raise SystemExit(
+                      f"custom frame {index} differs from reference: "
+                      f"guest={frame!r}; reference={expected!r}"
+                  )
+          last = frames[-1]
+          if last.predator_starvations == 0 or last.starvations == 0:
+              raise SystemExit(
+                  "custom trace did not exercise both starvation paths"
+              )
+          if last.predator_replacements != (
+              last.predator_starvations
+              + last.predator_forager_turnovers
+          ) & 0xFFFF:
+              raise SystemExit("custom predator replacement accounting failed")
+          if not (
+              config.sense_min * config.prey_count
+              <= last.prey_sense_sum
+              <= config.sense_max * config.prey_count
+          ):
+              raise SystemExit("custom prey sense mutation escaped bounds")
+          print(
+              "custom event-path differential passed with "
+              f"{last.starvations} prey and "
+              f"{last.predator_starvations} predator starvations"
           )
           PY

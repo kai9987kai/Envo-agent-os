@@ -2,38 +2,38 @@
   "artifacts": {
     "boot.bin": {
       "bytes": 512,
-      "sha256": "b595e72115d92800c8c307e815f2085396c8b750188321b8b88356129c631c7e"
+      "sha256": "99e360e71a0e58a60de03935ca7a07d850fca3f8bf30b99077d4da05f58b1cb4"
     },
     "experiment.json": {
-      "bytes": 1952,
-      "sha256": "f673bcc977ac95331574a3da37554db53db39ec3b998e555975b4bf950f7605b"
+      "bytes": 2486,
+      "sha256": "6067682fa11bc230d447f76cc140f34d6dde59dec31075de7ad3b515e5d18a08"
     },
     "floppy.img": {
       "bytes": 1474560,
-      "sha256": "f302d9c8ce8d281ff73c1963ffad4510b90df085fccbc7db5a732cee9ff3846b"
+      "sha256": "3f1ef9726ee89dc3e619914501104e2191697b0d61c39f7bf0a5a081264c76a0"
     },
     "kernel.bin": {
-      "bytes": 1535,
-      "sha256": "df60f68b46fd017e559a959389f48454d1542192fba9c91155b473d937390c59"
+      "bytes": 1892,
+      "sha256": "1fbc7c1993e37b8cd06f954e4df1c9f800575e5f126d4efe0492516ac3e3d138"
     },
     "os.iso": {
-      "bytes": 1525760,
-      "sha256": "73f3ef02430871f273900766f7ae832b9baf384d9887aedeff1dab93444a347d"
+      "bytes": 1527808,
+      "sha256": "5efd64d86af217eea8211f85f23a916c9a3bcaf571f23ce0bd6f5a27a65e0d3f"
     }
   },
-  "config_id": 61009,
-  "config_id_hex": "0xEE51",
-  "config_sha256": "51ee27c971677ec620c314428d94cb8449623e52e793b7f672a0cd4dcb491ed3",
+  "config_id": 10954,
+  "config_id_hex": "0x2ACA",
+  "config_sha256": "ca2a447a878b720bd31838d95dc3fa9fa9e19370d5a54b423a205d8308c1a5c0",
   "format_version": 2,
   "kernel_load_address": "0x1000",
-  "kernel_sectors": 3,
-  "model_abi_version": 3,
+  "kernel_sectors": 4,
+  "model_abi_version": 4,
   "project": "Envo Agent OS",
   "seed": 44257,
   "telemetry": {
     "interval_ticks": 1,
-    "record_bytes": 32,
-    "version": 2
+    "record_bytes": 48,
+    "version": 3
   },
-  "version": "1.2.0"
+  "version": "1.3.0"
 }

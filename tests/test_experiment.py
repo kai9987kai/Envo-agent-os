@@ -103,6 +103,32 @@ def test_every_mutable_model_input_changes_the_provenance_identity() -> None:
             config,
             food_energy=config.food_energy - 1,
         ),
+        "prey_base_metabolism": replace(
+            config,
+            prey_base_metabolism=config.prey_base_metabolism + 1,
+        ),
+        "predator_base_metabolism": replace(
+            config,
+            predator_base_metabolism=config.predator_base_metabolism + 1,
+        ),
+        "speed_metabolism": replace(
+            config,
+            speed_metabolism=config.speed_metabolism + 1,
+        ),
+        "sense_metabolism_shift": replace(
+            config,
+            sense_metabolism_shift=config.sense_metabolism_shift - 1,
+        ),
+        "predator_capture_energy": replace(
+            config,
+            predator_capture_energy=config.predator_capture_energy + 1,
+        ),
+        "predator_reproduction_energy": replace(
+            config,
+            predator_reproduction_energy=(
+                config.predator_reproduction_energy + 1
+            ),
+        ),
         "mutation_mask": replace(config, mutation_mask=7),
         "sense_min": replace(config, sense_min=config.sense_min - 1),
         "sense_max": replace(config, sense_max=config.sense_max - 1),
@@ -166,7 +192,7 @@ def test_runtime_layout_regions_are_exact_and_non_overlapping(
     assert layout.telemetry_buffer + TELEMETRY_RECORD_BYTES <= (
         layout.scratch_start
     )
-    assert layout.scratch_start + 16 == layout.data_base
+    assert layout.scratch_start + 22 == layout.data_base
     assert layout.data_end < 0xA000
     assert layout.data_end % 2 == 0
 
@@ -194,7 +220,7 @@ def test_guest_payload_contract_is_statically_inspectable() -> None:
     assert tuple(field.name for field in fields(FrameRecord)) == (
         TELEMETRY_PAYLOAD_FIELDS
     )
-    assert struct.calcsize("<9H4B2H") == TELEMETRY_PAYLOAD_BYTES
+    assert struct.calcsize("<9H4B7H4BH") == TELEMETRY_PAYLOAD_BYTES
     assert (
         len(TELEMETRY_MAGIC)
         + 3
@@ -214,7 +240,7 @@ def test_guest_payload_contract_is_statically_inspectable() -> None:
     )
 
 
-def test_kernel_statically_embeds_the_v2_payload_header_and_config_id() -> None:
+def test_kernel_statically_embeds_the_v3_payload_header_and_config_id() -> None:
     config = replace(ModelConfig(), seed=0x1234, telemetry_interval=2)
     image = assemble_kernel_config(config)
     emit_start = image.symbols["emit_telemetry"] - 0x1000
@@ -236,7 +262,7 @@ def test_kernel_statically_embeds_the_v2_payload_header_and_config_id() -> None:
 
     assert header_stores in emitter
     assert config_store in emitter
-    assert b"\xB9\x20\x00" in emitter
+    assert b"\xB9\x30\x00" in emitter
     assert len(image.code) <= MAX_KERNEL_SECTORS * SECTOR_SIZE
 
 

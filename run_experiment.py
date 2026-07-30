@@ -11,10 +11,17 @@ import sys
 import time
 from typing import Sequence
 
+from envo_config import load_model_config
 from envo_telemetry import (
+    FRAME_LENGTH,
+    FRAME_TYPE,
+    MAGIC,
+    PAYLOAD_LENGTH,
+    PROTOCOL_VERSION,
+    FrameRecord,
     TelemetryError,
+    decode_frame,
     load_experiment_config_id,
-    parse_frames,
     summarize_frames,
     verify_config_id,
 )
@@ -121,6 +128,108 @@ def _stop_process(process: subprocess.Popen[bytes]) -> bytes:
     return stderr
 
 
+def _ordered_boot_markers(raw_trace: bytes) -> tuple[int, int] | None:
+    boot = raw_trace.find(b"B")
+    if boot < 0:
+        return None
+    kernel = raw_trace.find(b"K", boot + 1)
+    if kernel < 0:
+        return None
+    return boot, kernel
+
+
+def validate_trace_sequence(
+    raw_trace: bytes,
+    telemetry_interval: int,
+    *,
+    allow_truncated_tail: bool = True,
+) -> list[FrameRecord]:
+    """Validate the exact post-boot frame sequence in a debugcon trace.
+
+    Debugcon writes are an ordered byte stream: after the ``B`` and ``K`` stage
+    markers, each complete telemetry record must begin at the next fixed frame
+    boundary. The only non-frame bytes accepted there are a final prefix of a
+    frame, because QEMU can be observed or terminated while that record is
+    still being written.
+    """
+
+    if (
+        isinstance(telemetry_interval, bool)
+        or not isinstance(telemetry_interval, int)
+        or not 1 <= telemetry_interval <= 0xFFFF
+    ):
+        raise ValueError("telemetry_interval must be in the range 1..65535")
+
+    markers = _ordered_boot_markers(raw_trace)
+    if markers is None:
+        raise ExperimentRunError("trace is missing ordered B -> K boot markers")
+    _, kernel = markers
+    frame_stream = raw_trace[kernel + 1 :]
+
+    frames: list[FrameRecord] = []
+    offset = 0
+    while len(frame_stream) - offset >= FRAME_LENGTH:
+        candidate = frame_stream[offset : offset + FRAME_LENGTH]
+        try:
+            frames.append(decode_frame(candidate))
+        except TelemetryError as exc:
+            absolute_offset = kernel + 1 + offset
+            raise ExperimentRunError(
+                "corrupt complete telemetry frame "
+                f"{len(frames)} at byte offset {absolute_offset}: {exc}"
+            ) from exc
+        offset += FRAME_LENGTH
+
+    tail = frame_stream[offset:]
+    if tail:
+        header = MAGIC + bytes((PROTOCOL_VERSION, FRAME_TYPE, PAYLOAD_LENGTH))
+        prefix_length = min(len(tail), len(header))
+        if tail[:prefix_length] != header[:prefix_length]:
+            absolute_offset = kernel + 1 + offset
+            raise ExperimentRunError(
+                "unexpected bytes after complete telemetry frames at byte "
+                f"offset {absolute_offset}; trailing data is not a frame prefix"
+            )
+        if not allow_truncated_tail:
+            raise ExperimentRunError(
+                "trace ends with a truncated telemetry frame: "
+                f"received {len(tail)} of {FRAME_LENGTH} bytes"
+            )
+
+    if frames and frames[0].tick != telemetry_interval:
+        raise ExperimentRunError(
+            f"first telemetry tick is {frames[0].tick}, expected {telemetry_interval}"
+        )
+    for index, (previous, current) in enumerate(
+        zip(frames, frames[1:]),
+        start=1,
+    ):
+        expected_tick = (previous.tick + telemetry_interval) & 0xFFFF
+        if current.tick != expected_tick:
+            raise ExperimentRunError(
+                f"telemetry frame {index} has tick {current.tick}, "
+                f"expected {expected_tick} after tick {previous.tick}"
+            )
+
+    payload_offset = len(MAGIC) + 3
+    tick_offset = payload_offset + 2
+    tick_end = tick_offset + 2
+    if tail and len(tail) >= tick_end:
+        partial_tick = int.from_bytes(tail[tick_offset:tick_end], "little")
+        expected_tick = (
+            telemetry_interval
+            if not frames
+            else (frames[-1].tick + telemetry_interval) & 0xFFFF
+        )
+        if partial_tick != expected_tick:
+            raise ExperimentRunError(
+                "truncated telemetry frame has tick "
+                f"{partial_tick}, expected {expected_tick}"
+            )
+
+    return frames
+
+
 def capture_experiment(
     *,
     media: Path,
@@ -138,6 +247,7 @@ def capture_experiment(
     if not experiment.is_file():
         raise ExperimentRunError(f"experiment identity not found: {experiment}")
 
+    config = load_model_config(experiment)
     expected_config_id = load_experiment_config_id(experiment)
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -163,18 +273,29 @@ def capture_experiment(
     captured = []
     while time.monotonic() < deadline:
         if temporary.is_file():
-            captured = parse_frames(temporary.read_bytes())
-            if len(captured) >= frames_required:
-                break
+            current_trace = temporary.read_bytes()
+            if _ordered_boot_markers(current_trace) is not None:
+                try:
+                    captured = validate_trace_sequence(
+                        current_trace,
+                        config.telemetry_interval,
+                    )
+                except ExperimentRunError:
+                    break
+                if len(captured) >= frames_required:
+                    break
         if process.poll() is not None:
             break
         time.sleep(0.05)
 
     stderr = _stop_process(process)
     raw_trace = temporary.read_bytes() if temporary.is_file() else b""
-    captured = parse_frames(raw_trace)
     if temporary.is_file():
         temporary.replace(output)
+    captured = validate_trace_sequence(
+        raw_trace,
+        config.telemetry_interval,
+    )
 
     if len(captured) < frames_required:
         detail = stderr.decode("utf-8", errors="replace").strip()
@@ -184,11 +305,6 @@ def capture_experiment(
             f"{frames_required} within {timeout_seconds:g} seconds; "
             f"trace retained at {output}{suffix}"
         )
-    boot = raw_trace.find(b"B")
-    kernel = raw_trace.find(b"K", boot + 1)
-    if not (0 <= boot < kernel):
-        raise ExperimentRunError("trace is missing ordered B -> K boot markers")
-
     verify_config_id(captured, expected_config_id)
     summary = summarize_frames(captured)
     summary.update(

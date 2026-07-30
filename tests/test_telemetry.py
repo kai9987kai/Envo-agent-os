@@ -5,6 +5,12 @@ import json
 
 import pytest
 
+from create_iso import VERSION
+from envo_config import (
+    ModelConfig,
+    build_experiment_document,
+    configuration_id,
+)
 from envo_telemetry import (
     FRAME_LENGTH,
     FrameChecksumError,
@@ -40,6 +46,16 @@ def _frame(**changes: int) -> FrameRecord:
         speed_4_count=6,
         max_generation=10,
         state_checksum=0xBEEF,
+        predator_replacements=7,
+        predator_starvations=2,
+        predator_forager_turnovers=5,
+        predator_energy_sum=400,
+        predator_sense_sum=400,
+        predator_speed_1_count=0,
+        predator_speed_2_count=0,
+        predator_speed_3_count=4,
+        predator_speed_4_count=0,
+        predator_max_generation=11,
     )
     return replace(base, **changes)
 
@@ -48,16 +64,16 @@ def test_frame_round_trip_and_checksum_contract() -> None:
     frame = _frame()
     encoded = encode_frame(frame)
 
-    assert len(encoded) == FRAME_LENGTH == 32
-    assert encoded[:5] == b"EV\x02\x01\x1a"
+    assert len(encoded) == FRAME_LENGTH == 48
+    assert encoded[:5] == b"EV\x03\x01\x2a"
     assert sum(encoded[2:]) & 0xFF == 0
     assert parse_frames(encoded, strict=True) == [frame]
 
 
 def test_frame_wire_format_has_a_stable_golden_vector() -> None:
     assert encode_frame(_frame()).hex() == (
-        "455602011a34122a00e1ac0300040005000600b80bdc05"
-        "070809060a00efbe5b"
+        "455603012a34122a00e1ac0300040005000600b80bdc05"
+        "070809060a00efbe07000200050090019001000004000b000b"
     )
 
 
@@ -78,6 +94,16 @@ def test_all_counter_widths_round_trip_at_maximum() -> None:
         speed_4_count=0xFF,
         max_generation=0xFFFF,
         state_checksum=0xFFFF,
+        predator_replacements=0xFFFF,
+        predator_starvations=0xFFFF,
+        predator_forager_turnovers=0xFFFF,
+        predator_energy_sum=0xFFFF,
+        predator_sense_sum=0xFFFF,
+        predator_speed_1_count=0xFF,
+        predator_speed_2_count=0xFF,
+        predator_speed_3_count=0xFF,
+        predator_speed_4_count=0xFF,
+        predator_max_generation=0xFFFF,
     )
 
     assert parse_frames(encode_frame(frame), strict=True) == [frame]
@@ -181,6 +207,9 @@ def test_summary_derives_population_metrics_and_wrapping_deltas() -> None:
         captures=0xFFFF,
         starvations=0,
         forager_turnovers=0,
+        predator_replacements=0xFFFF,
+        predator_starvations=0xFFFF,
+        predator_forager_turnovers=0,
     )
     second = _frame(
         tick=1,
@@ -188,6 +217,9 @@ def test_summary_derives_population_metrics_and_wrapping_deltas() -> None:
         captures=1,
         starvations=1,
         forager_turnovers=0,
+        predator_replacements=1,
+        predator_starvations=1,
+        predator_forager_turnovers=0,
         prey_energy_sum=3_000,
         prey_sense_sum=1_500,
     )
@@ -198,25 +230,40 @@ def test_summary_derives_population_metrics_and_wrapping_deltas() -> None:
     assert summary["tick_step"] == 2
     assert summary["interval_event_deltas"]["replacements"] == 3
     assert summary["replacement_accounting_ok"]
+    assert summary["predator_replacement_accounting_ok"]
     assert population["prey_count"] == 30
+    assert population["predator_count"] == 4
     assert population["mean_energy"] == 100
     assert population["mean_sense"] == 50
     assert population["mean_speed"] == pytest.approx(2.4666666667)
+    assert population["predator_mean_energy"] == 100
+    assert population["predator_mean_sense"] == 100
+    assert population["predator_mean_speed"] == 3
 
 
-def test_experiment_config_verification_accepts_hex_string(tmp_path) -> None:
+def test_experiment_config_verification_recomputes_canonical_identity(
+    tmp_path,
+) -> None:
     experiment = tmp_path / "experiment.json"
-    experiment.write_text(
-        json.dumps({"model": {"config_id": "0x1234"}}),
-        encoding="utf-8",
-    )
-    frames = [_frame(tick=1), _frame(tick=2)]
+    config = ModelConfig()
+    expected_id = configuration_id(config)
+    experiment.write_bytes(build_experiment_document(config, VERSION))
+    frames = [
+        _frame(tick=1, config_id=expected_id),
+        _frame(tick=2, config_id=expected_id),
+    ]
 
-    assert load_experiment_config_id(experiment) == 0x1234
-    verify_config_id(frames, 0x1234)
+    assert load_experiment_config_id(experiment) == expected_id
+    verify_config_id(frames, expected_id)
 
     with pytest.raises(ValueError, match="expected"):
         verify_config_id(frames, 0x9999)
+
+    document = json.loads(experiment.read_text(encoding="utf-8"))
+    document["config_id"] ^= 1
+    experiment.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="canonical identity"):
+        load_experiment_config_id(experiment)
 
 
 def test_cli_outputs_jsonl_and_checks_experiment(
@@ -224,12 +271,14 @@ def test_cli_outputs_jsonl_and_checks_experiment(
     capsys,
 ) -> None:
     trace = tmp_path / "trace.bin"
-    trace.write_bytes(encode_frame(_frame(tick=1)) + encode_frame(_frame(tick=2)))
-    experiment = tmp_path / "experiment.json"
-    experiment.write_text(
-        json.dumps({"config_id": 0x1234}),
-        encoding="utf-8",
+    config = ModelConfig()
+    expected_id = configuration_id(config)
+    trace.write_bytes(
+        encode_frame(_frame(tick=1, config_id=expected_id))
+        + encode_frame(_frame(tick=2, config_id=expected_id))
     )
+    experiment = tmp_path / "experiment.json"
+    experiment.write_bytes(build_experiment_document(config, VERSION))
 
     result = main(
         [
@@ -263,7 +312,7 @@ def test_cli_summary_and_config_mismatch(tmp_path, capsys) -> None:
     assert summary["captures"] == 8
 
     experiment = tmp_path / "experiment.json"
-    experiment.write_text(json.dumps({"config_id": 1}), encoding="utf-8")
+    experiment.write_bytes(build_experiment_document(ModelConfig(), VERSION))
     assert main([str(trace), "--experiment", str(experiment)]) == 1
     mismatch_output = capsys.readouterr()
     assert "config_id" in mismatch_output.err

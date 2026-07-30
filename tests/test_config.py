@@ -53,6 +53,30 @@ def test_generated_experiment_document_round_trips_as_build_input(
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("config_id", 0),
+        ("config_sha256", "0" * 64),
+        ("model_abi_version", 0),
+        ("runtime_layout", {}),
+        ("telemetry", {}),
+    ],
+)
+def test_generated_experiment_rejects_tampered_identity(
+    tmp_path,
+    field: str,
+    value: object,
+) -> None:
+    document = json.loads(build_experiment_document(ModelConfig(), VERSION))
+    document[field] = value
+    path = tmp_path / "tampered-experiment.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical identity"):
+        load_model_config(path)
+
+
+@pytest.mark.parametrize(
     "changes",
     [
         {"prey_count": 0},
@@ -60,6 +84,15 @@ def test_generated_experiment_document_round_trips_as_build_input(
         {"telemetry_interval": 3},
         {"reproduction_energy": 32_000, "food_energy": 1_000},
         {"prey_count": 32, "reproduction_energy": 3_000},
+        {"prey_base_metabolism": 0},
+        {"predator_base_metabolism": 100},
+        {"speed_metabolism": 128},
+        {"sense_metabolism_shift": 0},
+        {
+            "predator_reproduction_energy": 32_000,
+            "predator_capture_energy": 1_000,
+        },
+        {"predator_count": 16, "predator_reproduction_energy": 5_000},
     ],
 )
 def test_invalid_or_unobservable_configurations_are_rejected(
@@ -67,6 +100,21 @@ def test_invalid_or_unobservable_configurations_are_rejected(
 ) -> None:
     with pytest.raises(ValueError):
         replace(ModelConfig(), **changes)
+
+
+def test_every_coevolution_parameter_changes_guest_code() -> None:
+    config = ModelConfig()
+    baseline = build_kernel_config(config)
+    variants = (
+        replace(config, prey_base_metabolism=2),
+        replace(config, predator_base_metabolism=2),
+        replace(config, speed_metabolism=2),
+        replace(config, sense_metabolism_shift=4),
+        replace(config, predator_capture_energy=41),
+        replace(config, predator_reproduction_energy=161),
+    )
+
+    assert all(build_kernel_config(variant) != baseline for variant in variants)
 
 
 def test_custom_configuration_changes_kernel_and_embeds_identity() -> None:

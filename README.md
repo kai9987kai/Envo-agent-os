@@ -16,7 +16,7 @@ model.
 - Display: VGA Mode 13h, 320 x 200 pixels
 - Recommended host: QEMU on Windows, Linux, or macOS
 - Firmware support: legacy BIOS only; UEFI is future work
-- Experiment interface: release 1.2.0, model ABI 3, `EV` telemetry version 2
+- Experiment interface: release 1.3.0, model ABI 4, `EV` telemetry version 3
 - Maturity: experimental; compatibility and scientific validation are evolving
 
 Run the image in an emulator. Booting experimental media on physical hardware is
@@ -134,10 +134,12 @@ The reference is a verification oracle for the current mechanics, not an
 independently validated ecological model. Multi-seed statistical validation and
 MAP-Elites experiments remain roadmap work.
 
-Version 2 frames contain the tick and PRNG state, lineage replacements by
-cause, prey energy and sensing sums, the complete speed histogram, maximum
-generation, and a checksum of canonical guest state. Framing, checksums, and
-stream resynchronization, host comparison, identity rules, and limitations are
+Version 3 frames preserve every version 2 payload field at its previous offset
+and append predator replacement causes, energy and sensing sums, the complete
+predator speed histogram, and predator maximum generation. The resulting
+48-byte frame also carries the tick, PRNG state, prey metrics, and a checksum of
+canonical guest state. Framing, exact byte offsets, checksums, stream
+resynchronization, host comparison, identity rules, and limitations are
 specified in [TELEMETRY.md](TELEMETRY.md). The schema remains experimental
 rather than a stable external API.
 
@@ -152,20 +154,36 @@ rather than a stable external API.
 | `run_experiment.py` | Headless QEMU runner with frame and configuration validation |
 | `boot.asm` | Readable NASM reference for the Python-generated stage-1 loader |
 | `MODEL.md` | ODD-style model description, assumptions, and research roadmap |
-| `TELEMETRY.md` | Version 2 binary telemetry protocol |
+| `TELEMETRY.md` | Version 3 binary telemetry protocol |
 | `SECURITY.md` | Supported versions, safe-use guidance, and reporting process |
 | `boot.bin`, `floppy.img`, `os.iso` | Convenience artifacts; rebuild and verify before relying on them |
 
 ## Model scope
 
 The current world contains food, prey, and predators. Agents sense nearby
-entities, move, eat, and respond to a day/night cycle and a water region. Prey
-have heritable speed and sensing traits. A successful forager carries its own
-lineage into the next generation; starvation or predation refills the vacated
-slot from an unbiased random prey donor. In both paths, traits have a bounded
-chance to mutate and generation is incremented. Variable population size,
-predator evolution, quality-diversity search, and habitat disturbances remain
-future work. See [MODEL.md](MODEL.md) for the exact rules and roadmap.
+entities, move, eat, and respond to a day/night cycle and a water region. Both
+prey and predators have heritable speed and sensing traits. Their integer
+metabolic cost is
+
+```text
+base_metabolism
++ (speed - speed_min) * speed_metabolism
++ ((sense - sense_min) >> sense_metabolism_shift)
+```
+
+Prey pay that cost while active; predators pay it every tick. A successful prey
+forager carries its own lineage into the next generation, while starvation or
+capture refills the prey slot from an unbiased prey donor. Predator captures add
+a configured energy reward. Reaching the predator reproduction threshold
+advances that successful predator lineage; starvation instead refills its slot
+from an unbiased predator donor. Each inherited trait mutates independently
+with the configured bounded probability, and generation is incremented.
+
+This remains fixed-slot lineage turnover: population sizes do not vary, births
+do not split parental energy, and the configured capture reward is not a
+conserved transfer of prey energy. Variable demography, energy-conserving
+reproduction, quality-diversity search, and habitat disturbances remain future
+work. See [MODEL.md](MODEL.md) for the exact scheduling and assumptions.
 
 ## Current limitations
 
@@ -173,7 +191,7 @@ future work. See [MODEL.md](MODEL.md) for the exact rules and roadmap.
   hardware abstraction layer
 - No UEFI or Secure Boot path
 - Fixed 320 x 200 indexed-color display
-- Small, fixed-capacity populations and O(n^2) neighborhood scans
+- Small, fixed-size populations with slot replacement and O(n^2) scans
 - Educational model rather than a calibrated ecological simulation
 - Emulator-oriented timing and an experimental telemetry ABI with wrapping
   16-bit counters
@@ -207,6 +225,15 @@ The roadmap is grounded in primary research and current platform specifications:
 - Chaparro-Pedraza and Bank,
   [Evolving life-history traits promote biodiversity via eco-evolutionary
   feedback mechanisms (PLOS Biology 2025)](https://journals.plos.org/plosbiology/article?id=10.1371/journal.pbio.3003492)
+- Huang et al.,
+  [Dynamical trade-offs arise from antagonistic coevolution and decrease
+  intraspecific diversity (Nature Communications
+  2017)](https://doi.org/10.1038/s41467-017-01957-8)
+- Salahshour,
+  [The interplay of trophic interactions and game dynamics gives rise to
+  life-history trade-offs, consistent personalities, and predator-prey and
+  aggression power laws (New Journal of Physics
+  2025)](https://doi.org/10.1088/1367-2630/adaedd)
 - Bettini, Shankar, and Prorok,
   [System Neural Diversity (JMLR 2025)](https://www.jmlr.org/papers/v26/24-1477.html)
 - [Intel 64 and IA-32 Software Developer's Manuals](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
@@ -215,9 +242,11 @@ The roadmap is grounded in primary research and current platform specifications:
 - [UEFI Specification 2.11](https://uefi.org/specifications)
 
 The replication papers motivate the implemented description and observation
-surfaces. The life-history, phylogeny, diversity, and quality-diversity papers
-motivate future experiments. None implies that Envo Agent OS reproduces their
-models or results.
+surfaces. The coevolution and trophic-energy papers motivate the implemented
+costed predator/prey traits and predator energy loop, while the remaining
+life-history, phylogeny, diversity, and quality-diversity work motivates future
+experiments. Envo uses deliberately smaller integer mechanisms and does not
+claim to reproduce any cited model or result.
 
 ## License and conduct
 

@@ -37,7 +37,7 @@ from envo_config import (
 )
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SECTOR_SIZE = 512
 ISO_SECTOR_SIZE = 2048
 FLOPPY_SIZE = 1_474_560
@@ -134,6 +134,7 @@ class ASM:
     def jg(self, label): self._relative_patch(0x7F, label, 1)
     def jle(self, label): self._relative_patch(0x7E, label, 1)
     def jge(self, label): self._relative_patch(0x7D, label, 1)
+    def jbe(self, label): self._relative_patch(0x76, label, 1)
     def jcxz(self, label): self._relative_patch(0xE3, label, 1)
     def jc(self, label): self._relative_patch(0x72, label, 1)
     def jnc(self, label): self._relative_patch(0x73, label, 1)
@@ -308,8 +309,9 @@ def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
     VGA_SEG = 0xA000
 
     # Entity: X, Y, energy, speed, sense, generation (six 16-bit words).
-    # Scratch words below DATA_BASE: PRNG, tick, replacements, captures,
-    # target, min distance, starvations, and successful-forager turnovers.
+    # Scratch words below DATA_BASE: PRNG, tick, prey replacements, captures,
+    # target, min distance, prey starvation/forager turnovers, then predator
+    # replacements, starvation turnovers, and successful-forager turnovers.
 
     asm.label('start')
     asm.cli()
@@ -321,7 +323,7 @@ def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
     # Reproducible runtime state.
     asm.mov_bx(DATA_BASE - 2); asm.mov_ax(seed); asm.db(b"\x89\x07")
     asm.xor_ax_ax()
-    for offset in (4, 6, 8, 10, 12, 14, 16):
+    for offset in (4, 6, 8, 10, 12, 14, 16, 18, 20, 22):
         asm.mov_bx(DATA_BASE - offset); asm.db(b"\x89\x07")
 
     # Reset ES to 0 for data operations
@@ -417,9 +419,9 @@ def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
 
     # --- FUNCTIONS ---
 
-    # Fixed 32-byte experiment record:
-    # EV, version, type, payload length, nine words, speed histogram,
-    # max generation, state checksum, and an additive checksum byte.
+    # Fixed 48-byte experiment record. Version 3 preserves the complete v2
+    # payload prefix, then appends predator counters, energy/sense aggregates,
+    # a speed histogram, and maximum generation before the checksum byte.
     asm.label('emit_telemetry')
     asm.pusha(); asm.db(b"\x06")  # PUSH ES
     asm.xor_ax_ax(); asm.mov_es_ax()
@@ -443,9 +445,19 @@ def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
     ):
         asm.mov_bx(address); asm.db(b"\x8B\x07"); asm.stosw()
 
-    # Reserve energy sum, sense sum, four speed bins, max generation, and
-    # the state checksum. All are filled below.
+    # Reserve prey energy/sense sums, four speed bins, max generation, and
+    # the state checksum. All are filled below; this preserves v2 offsets.
     asm.xor_ax_ax(); asm.mov_cx(6); asm.rep_stosw()
+
+    for address in (
+        DATA_BASE - 18,  # predator replacements
+        DATA_BASE - 20,  # predator starvation turnovers
+        DATA_BASE - 22,  # predator successful-forager turnovers
+    ):
+        asm.mov_bx(address); asm.db(b"\x8B\x07"); asm.stosw()
+
+    # Reserve predator energy/sense sums, four speed bins, and max generation.
+    asm.xor_ax_ax(); asm.mov_cx(5); asm.rep_stosw()
 
     asm.mov_si(prey_base); asm.mov_cx(NUM_PREY)
     asm.label('telemetry_metric_loop')
@@ -457,12 +469,31 @@ def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
     asm.db(b"\xFE\x87"); asm.dw(layout.telemetry_buffer + 23)
     asm.db(b"\x8B\x44\x0A")
     asm.db(b"\x3B\x06"); asm.dw(layout.telemetry_buffer + 27)
-    asm.jle('telemetry_generation_done')
+    asm.jbe('telemetry_generation_done')
     asm.db(b"\xA3"); asm.dw(layout.telemetry_buffer + 27)
     asm.label('telemetry_generation_done')
     asm.db(b"\x83\xC6"); asm.db(ENT_SIZE)
     asm.dec_cx(); asm.jcxz('telemetry_metrics_done'); asm.jmp('telemetry_metric_loop')
     asm.label('telemetry_metrics_done')
+
+    asm.mov_si(predator_base); asm.mov_cx(NUM_PRED)
+    asm.label('telemetry_predator_metric_loop')
+    asm.db(b"\x8B\x44\x04")  # MOV AX, [SI+4]
+    asm.db(b"\x01\x06"); asm.dw(layout.telemetry_buffer + 37)
+    asm.db(b"\x8B\x44\x08")  # MOV AX, [SI+8]
+    asm.db(b"\x01\x06"); asm.dw(layout.telemetry_buffer + 39)
+    asm.db(b"\x8B\x5C\x06\x4B")  # MOV BX, [SI+6]; DEC BX
+    asm.db(b"\xFE\x87"); asm.dw(layout.telemetry_buffer + 41)
+    asm.db(b"\x8B\x44\x0A")
+    asm.db(b"\x3B\x06"); asm.dw(layout.telemetry_buffer + 45)
+    asm.jbe('telemetry_predator_generation_done')
+    asm.db(b"\xA3"); asm.dw(layout.telemetry_buffer + 45)
+    asm.label('telemetry_predator_generation_done')
+    asm.db(b"\x83\xC6"); asm.db(ENT_SIZE)
+    asm.dec_cx()
+    asm.jcxz('telemetry_predator_metrics_done')
+    asm.jmp('telemetry_predator_metric_loop')
+    asm.label('telemetry_predator_metrics_done')
 
     # Canonical guest-state checksum: a wrapping sum of every 16-bit word in
     # the food, prey, and predator regions after the completed model update.
@@ -577,6 +608,25 @@ def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
     asm.mov_ax(2); asm.db(b"\x89\x44\x02")
     asm.label('clamp_done'); asm.ret()
 
+    # Trait-dependent metabolism creates a bounded performance/energy
+    # trade-off. Input SI points to an agent; output BX is the exact cost.
+    asm.label('prey_metabolic_cost')
+    asm.mov_bx(config.prey_base_metabolism)
+    asm.jmp('metabolic_trait_cost')
+    asm.label('predator_metabolic_cost')
+    asm.mov_bx(config.predator_base_metabolism)
+    asm.label('metabolic_trait_cost')
+    asm.db(b"\x8B\x44\x06")  # MOV AX,[SI+6] (speed)
+    asm.sub_ax(config.speed_min)
+    if config.speed_metabolism != 1:
+        asm.db(b"\x6B\xC0"); asm.db(config.speed_metabolism)
+    asm.db(b"\x01\xC3")  # ADD BX,AX
+    asm.db(b"\x8B\x44\x08")  # MOV AX,[SI+8] (sense)
+    asm.sub_ax(config.sense_min)
+    asm.db(b"\xC1\xE8"); asm.db(config.sense_metabolism_shift)
+    asm.db(b"\x01\xC3")  # ADD BX,AX
+    asm.ret()
+
     # Fixed-population asexual replacement. Vacated slots use an unbiased
     # random living donor; successful foragers preserve their own lineage.
     asm.label('rebirth_prey')
@@ -625,7 +675,69 @@ def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
     asm.label('sense_store'); asm.db(b"\x89\x5E\x08")
 
     asm.db(b"\x8B\x44\x0A"); asm.inc_ax(); asm.db(b"\x89\x46\x0A")
-    asm.mov_bx(DATA_BASE - 6); asm.db(b"\xFF\x07")  # births++
+    asm.mov_bx(DATA_BASE - 6); asm.db(b"\xFF\x07")  # prey replacements++
+    asm.popa(); asm.ret()
+
+    # Predator turnover mirrors prey inheritance while drawing parents only
+    # from the predator population and maintaining independent event counts.
+    asm.label('rebirth_predator')
+    asm.pusha()
+    asm.db(b"\x89\xFD")  # MOV BP, DI (destination slot)
+    asm.call('rand_x'); asm.db(b"\x89\x46\x00")
+    asm.call('rand_y'); asm.db(b"\x89\x46\x02")
+    asm.mov_ax(config.initial_energy); asm.db(b"\x89\x46\x04")
+
+    asm.label('random_predator_parent_retry')
+    predator_parent_mask = (1 << (NUM_PRED - 1).bit_length()) - 1
+    asm.call('rand')
+    asm.and_ax(predator_parent_mask)
+    asm.cmp_ax(NUM_PRED)
+    asm.jge('random_predator_parent_retry')
+    asm.db(b"\x89\xC3\xC1\xE0\x03\xC1\xE3\x02\x01\xD8")
+    asm.mov_si(predator_base); asm.db(b"\x01\xC6")
+    asm.jmp('inherit_predator_genes')
+
+    asm.label('rebirth_predator_self')
+    asm.pusha()
+    asm.db(b"\x89\xFD")
+    asm.call('rand_x'); asm.db(b"\x89\x46\x00")
+    asm.call('rand_y'); asm.db(b"\x89\x46\x02")
+    asm.mov_ax(config.initial_energy); asm.db(b"\x89\x46\x04")
+    asm.db(b"\x89\xEE")  # MOV SI, BP
+
+    asm.label('inherit_predator_genes')
+    asm.db(b"\x8B\x5C\x06")
+    asm.call('rand'); asm.db(b"\xA8"); asm.db(config.mutation_mask)
+    asm.jne('predator_speed_store')
+    asm.call('rand'); asm.db(b"\xA8\x01")
+    asm.je('predator_speed_down')
+    asm.db(0x43); asm.cmp_bx(config.speed_max)
+    asm.jle('predator_speed_store')
+    asm.mov_bx(config.speed_max); asm.jmp('predator_speed_store')
+    asm.label('predator_speed_down')
+    asm.db(0x4B); asm.cmp_bx(config.speed_min)
+    asm.jge('predator_speed_store')
+    asm.mov_bx(config.speed_min)
+    asm.label('predator_speed_store'); asm.db(b"\x89\x5E\x06")
+
+    asm.db(b"\x8B\x5C\x08")
+    asm.call('rand'); asm.db(b"\xA8"); asm.db(config.mutation_mask)
+    asm.jne('predator_sense_store')
+    asm.call('rand'); asm.db(b"\xA8\x01")
+    asm.je('predator_sense_down')
+    asm.db(b"\x83\xC3"); asm.db(config.sense_mutation_step)
+    asm.cmp_bx(config.sense_max)
+    asm.jle('predator_sense_store')
+    asm.mov_bx(config.sense_max); asm.jmp('predator_sense_store')
+    asm.label('predator_sense_down')
+    asm.db(b"\x83\xEB"); asm.db(config.sense_mutation_step)
+    asm.cmp_bx(config.sense_min)
+    asm.jge('predator_sense_store')
+    asm.mov_bx(config.sense_min)
+    asm.label('predator_sense_store'); asm.db(b"\x89\x5E\x08")
+
+    asm.db(b"\x8B\x44\x0A"); asm.inc_ax(); asm.db(b"\x89\x46\x0A")
+    asm.mov_bx(DATA_BASE - 18); asm.db(b"\xFF\x07")
     asm.popa(); asm.ret()
 
     # Update Food
@@ -659,8 +771,12 @@ def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
     asm.jmp('prey_draw')
 
     asm.label('prey_awake')
-    asm.db(b"\xFF\x4C\x04")  # metabolism: DEC word [SI+4]
-    asm.jne('prey_has_energy')
+    asm.call('prey_metabolic_cost')
+    asm.db(b"\x8B\x44\x04\x39\xD8")  # MOV AX,[SI+4]; CMP AX,BX
+    asm.jbe('prey_starved')
+    asm.db(b"\x29\x5C\x04")  # SUB [SI+4],BX
+    asm.jmp('prey_has_energy')
+    asm.label('prey_starved')
     asm.mov_bx(DATA_BASE - 14); asm.db(b"\xFF\x07")  # starvations++
     asm.db(b"\x89\xF7"); asm.call('rebirth_prey'); asm.jmp('prey_draw')
 
@@ -748,6 +864,17 @@ def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
     asm.label('pred_loop')
     asm.pusha()
 
+    asm.call('predator_metabolic_cost')
+    asm.db(b"\x8B\x44\x04\x39\xD8")  # MOV AX,[SI+4]; CMP AX,BX
+    asm.jbe('pred_starved')
+    asm.db(b"\x29\x5C\x04")  # SUB [SI+4],BX
+    asm.jmp('pred_has_energy')
+    asm.label('pred_starved')
+    asm.mov_bx(DATA_BASE - 20); asm.db(b"\xFF\x07")
+    asm.db(b"\x89\xF7"); asm.call('rebirth_predator')
+    asm.jmp('pred_draw')
+
+    asm.label('pred_has_energy')
     asm.mov_di(prey_base)
     asm.mov_dx(NUM_PREY)
     asm.mov_bx(DATA_BASE - 12); asm.mov_ax(0x7FFF); asm.db(b"\x89\x07")
@@ -810,11 +937,18 @@ def assemble_kernel_config(config: ModelConfig) -> AssemblyImage:
 
     asm.call('rebirth_prey')
     asm.mov_bx(DATA_BASE - 8); asm.db(b"\xFF\x07")  # kills++
+    asm.db(b"\x81\x44\x04"); asm.dw(config.predator_capture_energy)
+    asm.db(b"\x81\x7C\x04"); asm.dw(config.predator_reproduction_energy)
+    asm.jl('predator_ate')
+    asm.mov_bx(DATA_BASE - 22); asm.db(b"\xFF\x07")
+    asm.db(b"\x89\xF7"); asm.call('rebirth_predator_self')
+    asm.label('predator_ate')
     asm.mov_bx(0x0F); asm.jmp('pred_draw_c')
     asm.label('no_kill')
     asm.db(b"\x83\xC7\x0C"); asm.dec_dx(); asm.cmp_dx(0); asm.je('kill_done'); asm.jmp('kill_loop')
     asm.label('kill_done')
 
+    asm.label('pred_draw')
     asm.mov_bx(COLOR_PRED)
     asm.label('pred_draw_c')
     asm.db(b"\x8B\x0C\x8B\x54\x02"); asm.call('draw_pixel')

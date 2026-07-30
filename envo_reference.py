@@ -1,4 +1,4 @@
-"""Exact pure-Python reference model for the Envo Agent OS v2 guest."""
+"""Exact pure-Python reference model for the Envo Agent OS v3 guest."""
 
 from __future__ import annotations
 
@@ -108,6 +108,9 @@ class ReferenceModel:
         self.captures = 0
         self.starvations = 0
         self.forager_turnovers = 0
+        self.predator_replacements = 0
+        self.predator_starvations = 0
+        self.predator_forager_turnovers = 0
         self.food: list[FoodRecord] = []
         self.prey: list[AgentRecord] = []
         self.predators: list[AgentRecord] = []
@@ -188,11 +191,15 @@ class ReferenceModel:
                 prey.energy = _word(prey.energy + 1)
             return
 
-        prey.energy = _word(prey.energy - 1)
-        if prey.energy == 0:
+        metabolic_cost = self._metabolic_cost(
+            prey,
+            base=config.prey_base_metabolism,
+        )
+        if prey.energy <= metabolic_cost:
             self.starvations = _word(self.starvations + 1)
             self._rebirth_from_random_donor(prey)
             return
+        prey.energy = _word(prey.energy - metabolic_cost)
 
         visible_predator = self._first_visible_predator(prey)
         if visible_predator is None:
@@ -284,18 +291,50 @@ class ReferenceModel:
             parent_index = self._next_random() & parent_mask
             if parent_index < self.config.prey_count:
                 break
-        self._inherit(destination, self.prey[parent_index])
+        self._inherit(destination, self.prey[parent_index], predator=False)
 
     def _rebirth_from_self(self, destination: AgentRecord) -> None:
         destination.x = self._random_x()
         destination.y = self._random_y()
         destination.energy = self.config.initial_energy
-        self._inherit(destination, destination)
+        self._inherit(destination, destination, predator=False)
+
+    def _rebirth_predator_from_random_donor(
+        self,
+        destination: AgentRecord,
+    ) -> None:
+        destination.x = self._random_x()
+        destination.y = self._random_y()
+        destination.energy = self.config.initial_energy
+
+        parent_mask = (
+            1 << (self.config.predator_count - 1).bit_length()
+        ) - 1
+        while True:
+            parent_index = self._next_random() & parent_mask
+            if parent_index < self.config.predator_count:
+                break
+        self._inherit(
+            destination,
+            self.predators[parent_index],
+            predator=True,
+        )
+
+    def _rebirth_predator_from_self(
+        self,
+        destination: AgentRecord,
+    ) -> None:
+        destination.x = self._random_x()
+        destination.y = self._random_y()
+        destination.energy = self.config.initial_energy
+        self._inherit(destination, destination, predator=True)
 
     def _inherit(
         self,
         destination: AgentRecord,
         parent: AgentRecord,
+        *,
+        predator: bool,
     ) -> None:
         config = self.config
         speed = parent.speed
@@ -314,16 +353,43 @@ class ReferenceModel:
                     config.sense_max,
                 )
             else:
-                sense = max(
-                    _word(sense - config.sense_mutation_step),
-                    config.sense_min,
-                )
+                sense = _word(sense - config.sense_mutation_step)
+                if _signed_less(sense, config.sense_min):
+                    sense = config.sense_min
         destination.sense = _word(sense)
         destination.generation = _word(parent.generation + 1)
-        self.replacements = _word(self.replacements + 1)
+        if predator:
+            self.predator_replacements = _word(
+                self.predator_replacements + 1
+            )
+        else:
+            self.replacements = _word(self.replacements + 1)
+
+    def _metabolic_cost(self, agent: AgentRecord, *, base: int) -> int:
+        config = self.config
+        return (
+            base
+            + (agent.speed - config.speed_min) * config.speed_metabolism
+            + (
+                (agent.sense - config.sense_min)
+                >> config.sense_metabolism_shift
+            )
+        )
 
     def _update_predator(self, predator_index: int) -> None:
         predator = self.predators[predator_index]
+        metabolic_cost = self._metabolic_cost(
+            predator,
+            base=self.config.predator_base_metabolism,
+        )
+        if predator.energy <= metabolic_cost:
+            self.predator_starvations = _word(
+                self.predator_starvations + 1
+            )
+            self._rebirth_predator_from_random_donor(predator)
+            return
+        predator.energy = _word(predator.energy - metabolic_cost)
+
         target = self._closest_prey(predator)
 
         if target is not None:
@@ -337,6 +403,17 @@ class ReferenceModel:
                 continue
             self._rebirth_from_random_donor(prey)
             self.captures = _word(self.captures + 1)
+            predator.energy = _word(
+                predator.energy + self.config.predator_capture_energy
+            )
+            if not _signed_less(
+                predator.energy,
+                self.config.predator_reproduction_energy,
+            ):
+                self.predator_forager_turnovers = _word(
+                    self.predator_forager_turnovers + 1
+                )
+                self._rebirth_predator_from_self(predator)
             return
 
     def _closest_prey(self, predator: AgentRecord) -> AgentRecord | None:
@@ -407,8 +484,26 @@ class ReferenceModel:
             speed_counts[speed_index] = _word(
                 speed_counts[speed_index] + 1
             ) & 0xFF
-            if _signed_greater(prey.generation, maximum_generation):
+            if prey.generation > maximum_generation:
                 maximum_generation = prey.generation
+
+        predator_energy_sum = 0
+        predator_sense_sum = 0
+        predator_speed_counts = [0, 0, 0, 0]
+        predator_maximum_generation = 0
+        for predator in self.predators:
+            predator_energy_sum = _word(
+                predator_energy_sum + predator.energy
+            )
+            predator_sense_sum = _word(
+                predator_sense_sum + predator.sense
+            )
+            speed_index = _word(predator.speed - 1)
+            predator_speed_counts[speed_index] = _word(
+                predator_speed_counts[speed_index] + 1
+            ) & 0xFF
+            if predator.generation > predator_maximum_generation:
+                predator_maximum_generation = predator.generation
 
         return FrameRecord(
             config_id=self.config_id,
@@ -426,6 +521,16 @@ class ReferenceModel:
             speed_4_count=speed_counts[3],
             max_generation=maximum_generation,
             state_checksum=self.state_checksum(),
+            predator_replacements=self.predator_replacements,
+            predator_starvations=self.predator_starvations,
+            predator_forager_turnovers=self.predator_forager_turnovers,
+            predator_energy_sum=predator_energy_sum,
+            predator_sense_sum=predator_sense_sum,
+            predator_speed_1_count=predator_speed_counts[0],
+            predator_speed_2_count=predator_speed_counts[1],
+            predator_speed_3_count=predator_speed_counts[2],
+            predator_speed_4_count=predator_speed_counts[3],
+            predator_max_generation=predator_maximum_generation,
         )
 
 

@@ -9,18 +9,18 @@ from pathlib import Path
 from typing import Any
 
 
-MODEL_ABI_VERSION = 3
+MODEL_ABI_VERSION = 4
 EXPERIMENT_FORMAT_VERSION = 1
 DEFAULT_SEED = 0xACE1
 DATA_BASE = 0x9000
 FOOD_RECORD_BYTES = 6
 AGENT_RECORD_BYTES = 12
-TELEMETRY_BUFFER_BYTES = 64
-TELEMETRY_RECORD_BYTES = 32
+TELEMETRY_BUFFER_BYTES = 96
+TELEMETRY_RECORD_BYTES = 48
 TELEMETRY_MAGIC = b"EV"
-TELEMETRY_VERSION = 2
+TELEMETRY_VERSION = 3
 TELEMETRY_FRAME_TYPE = 1
-TELEMETRY_PAYLOAD_BYTES = 26
+TELEMETRY_PAYLOAD_BYTES = 42
 TELEMETRY_PAYLOAD_FIELDS = (
     "config_id",
     "tick",
@@ -37,6 +37,16 @@ TELEMETRY_PAYLOAD_FIELDS = (
     "speed_4_count",
     "max_generation",
     "state_checksum",
+    "predator_replacements",
+    "predator_starvations",
+    "predator_forager_turnovers",
+    "predator_energy_sum",
+    "predator_sense_sum",
+    "predator_speed_1_count",
+    "predator_speed_2_count",
+    "predator_speed_3_count",
+    "predator_speed_4_count",
+    "predator_max_generation",
 )
 
 
@@ -59,6 +69,12 @@ class ModelConfig:
     predator_initial_sense: int = 100
     reproduction_energy: int = 160
     food_energy: int = 20
+    prey_base_metabolism: int = 1
+    predator_base_metabolism: int = 1
+    speed_metabolism: int = 1
+    sense_metabolism_shift: int = 5
+    predator_capture_energy: int = 40
+    predator_reproduction_energy: int = 160
     mutation_mask: int = 3
     speed_min: int = 1
     speed_max: int = 4
@@ -75,6 +91,7 @@ class ModelConfig:
             "prey_initial_sense": self.prey_initial_sense,
             "predator_initial_sense": self.predator_initial_sense,
             "reproduction_energy": self.reproduction_energy,
+            "predator_reproduction_energy": self.predator_reproduction_energy,
             "sense_min": self.sense_min,
             "sense_max": self.sense_max,
             "day_night_mask": self.day_night_mask,
@@ -92,7 +109,7 @@ class ModelConfig:
         if not 1 <= self.predator_count <= 16:
             raise ValueError("predator_count must be in the range 1..16")
         if self.speed_min != 1 or self.speed_max != 4:
-            raise ValueError("the v2 telemetry ABI requires speed bounds 1..4")
+            raise ValueError("the v3 telemetry ABI requires speed bounds 1..4")
         if not self.speed_min <= self.prey_initial_speed <= self.speed_max:
             raise ValueError("prey_initial_speed is outside the speed bounds")
         if not self.speed_min <= self.predator_initial_speed <= self.speed_max:
@@ -103,16 +120,71 @@ class ModelConfig:
             raise ValueError("predator_initial_sense is outside the sense bounds")
         if not 1 <= self.food_energy <= 0x7FFF:
             raise ValueError("food_energy must be in the range 1..32767")
+        for name, value in (
+            ("prey_base_metabolism", self.prey_base_metabolism),
+            ("predator_base_metabolism", self.predator_base_metabolism),
+            ("speed_metabolism", self.speed_metabolism),
+        ):
+            if not 1 <= value <= 0x7F:
+                raise ValueError(f"{name} must be in the range 1..127")
+        if not 1 <= self.sense_metabolism_shift <= 15:
+            raise ValueError("sense_metabolism_shift must be in the range 1..15")
+        if not 1 <= self.predator_capture_energy <= 0x7FFF:
+            raise ValueError(
+                "predator_capture_energy must be in the range 1..32767"
+            )
         if self.initial_energy >= self.reproduction_energy:
             raise ValueError("initial_energy must be below reproduction_energy")
+        if self.initial_energy >= self.predator_reproduction_energy:
+            raise ValueError(
+                "initial_energy must be below predator_reproduction_energy"
+            )
+        if self.prey_base_metabolism >= self.initial_energy:
+            raise ValueError(
+                "prey_base_metabolism must be below initial_energy"
+            )
+        if self.predator_base_metabolism >= self.initial_energy:
+            raise ValueError(
+                "predator_base_metabolism must be below initial_energy"
+            )
         if self.reproduction_energy + self.food_energy > 0x7FFF:
             raise ValueError(
                 "reproduction_energy plus food_energy must not exceed 32767"
             )
+        if (
+            self.predator_reproduction_energy
+            + self.predator_capture_energy
+            > 0x7FFF
+        ):
+            raise ValueError(
+                "predator_reproduction_energy plus "
+                "predator_capture_energy must not exceed 32767"
+            )
         if self.reproduction_energy * self.prey_count > 0xFFFF:
             raise ValueError("prey energy sum does not fit the telemetry ABI")
+        if (
+            self.predator_reproduction_energy * self.predator_count
+            > 0xFFFF
+        ):
+            raise ValueError(
+                "predator energy sum does not fit the telemetry ABI"
+            )
         if self.sense_max * self.prey_count > 0xFFFF:
             raise ValueError("prey sense sum does not fit the telemetry ABI")
+        if self.sense_max * self.predator_count > 0xFFFF:
+            raise ValueError("predator sense sum does not fit the telemetry ABI")
+        maximum_trait_cost = (
+            (self.speed_max - self.speed_min) * self.speed_metabolism
+            + (
+                (self.sense_max - self.sense_min)
+                >> self.sense_metabolism_shift
+            )
+        )
+        if (
+            self.prey_base_metabolism + maximum_trait_cost > 0x7FFF
+            or self.predator_base_metabolism + maximum_trait_cost > 0x7FFF
+        ):
+            raise ValueError("maximum trait-dependent metabolism exceeds 32767")
         if not 2 <= self.waterline <= 196:
             raise ValueError("waterline must be in the range 2..196")
         if not _is_power_of_two(self.day_night_mask):
@@ -181,7 +253,7 @@ class RuntimeLayout:
     @classmethod
     def from_config(cls, config: ModelConfig) -> "RuntimeLayout":
         telemetry_buffer = DATA_BASE - TELEMETRY_BUFFER_BYTES
-        scratch_start = DATA_BASE - 16
+        scratch_start = DATA_BASE - 22
         food_base = DATA_BASE
         prey_base = food_base + config.food_count * FOOD_RECORD_BYTES
         predator_base = prey_base + config.prey_count * AGENT_RECORD_BYTES
@@ -230,7 +302,10 @@ def canonical_identity(config: ModelConfig) -> dict[str, Any]:
             "version": TELEMETRY_VERSION,
             "frame_type": TELEMETRY_FRAME_TYPE,
             "payload_bytes": TELEMETRY_PAYLOAD_BYTES,
-            "payload_encoding": "9 little-endian words, 4 bytes, then 2 words",
+            "payload_encoding": (
+                "9 little-endian words, 4 bytes, 7 words, 4 bytes, "
+                "then 1 word"
+            ),
             "payload_fields": list(TELEMETRY_PAYLOAD_FIELDS),
             "record_bytes": TELEMETRY_RECORD_BYTES,
             "checksum": "8-bit two's-complement sum over version through payload",
@@ -271,6 +346,39 @@ def build_experiment_document(config: ModelConfig, project_version: str) -> byte
     return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
+def validate_experiment_document(document: object) -> ModelConfig:
+    """Validate a generated experiment document against canonical identity."""
+
+    if not isinstance(document, dict):
+        raise ValueError("experiment document must be a JSON object")
+    if "configuration" not in document:
+        raise ValueError("experiment document is missing configuration")
+
+    config = ModelConfig.from_mapping(document)
+    expected = {
+        "format_version": EXPERIMENT_FORMAT_VERSION,
+        "project": "Envo Agent OS",
+        "config_id": configuration_id(config),
+        "config_id_hex": f"0x{configuration_id(config):04X}",
+        "config_sha256": configuration_sha256(config),
+        **canonical_identity(config),
+    }
+    for key, expected_value in expected.items():
+        if key not in document:
+            raise ValueError(f"experiment document is missing {key}")
+        if document[key] != expected_value:
+            raise ValueError(
+                f"experiment document {key} does not match canonical identity"
+            )
+
+    project_version = document.get("project_version")
+    if not isinstance(project_version, str) or not project_version:
+        raise ValueError(
+            "experiment document project_version must be a non-empty string"
+        )
+    return config
+
+
 def load_model_config(path: Path) -> ModelConfig:
     """Read a strict model configuration from JSON."""
 
@@ -282,4 +390,9 @@ def load_model_config(path: Path) -> ModelConfig:
         ) from exc
     if not isinstance(document, dict):
         raise ValueError(f"{path}: top-level JSON value must be an object")
+    if "configuration" in document:
+        try:
+            return validate_experiment_document(document)
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}") from exc
     return ModelConfig.from_mapping(document)

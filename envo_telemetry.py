@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, fields
 import json
 from pathlib import Path
@@ -16,6 +16,8 @@ from envo_config import (
     TELEMETRY_PAYLOAD_BYTES,
     TELEMETRY_RECORD_BYTES,
     TELEMETRY_VERSION,
+    configuration_id,
+    load_model_config,
 )
 
 
@@ -26,7 +28,7 @@ PAYLOAD_LENGTH = TELEMETRY_PAYLOAD_BYTES
 FRAME_LENGTH = TELEMETRY_RECORD_BYTES
 
 _HEADER = struct.Struct("<2sBBB")
-_PAYLOAD = struct.Struct("<9H4B2H")
+_PAYLOAD = struct.Struct("<9H4B7H4BH")
 _U16_FIELDS = (
     "config_id",
     "tick",
@@ -39,12 +41,22 @@ _U16_FIELDS = (
     "prey_sense_sum",
     "max_generation",
     "state_checksum",
+    "predator_replacements",
+    "predator_starvations",
+    "predator_forager_turnovers",
+    "predator_energy_sum",
+    "predator_sense_sum",
+    "predator_max_generation",
 )
 _U8_FIELDS = (
     "speed_1_count",
     "speed_2_count",
     "speed_3_count",
     "speed_4_count",
+    "predator_speed_1_count",
+    "predator_speed_2_count",
+    "predator_speed_3_count",
+    "predator_speed_4_count",
 )
 
 
@@ -70,7 +82,7 @@ class ConfigMismatchError(TelemetryError):
 
 @dataclass(frozen=True)
 class FrameRecord:
-    """Decoded payload from one version 2 frame."""
+    """Decoded payload from one version 3 frame."""
 
     config_id: int
     tick: int
@@ -87,6 +99,16 @@ class FrameRecord:
     speed_4_count: int
     max_generation: int
     state_checksum: int
+    predator_replacements: int
+    predator_starvations: int
+    predator_forager_turnovers: int
+    predator_energy_sum: int
+    predator_sense_sum: int
+    predator_speed_1_count: int
+    predator_speed_2_count: int
+    predator_speed_3_count: int
+    predator_speed_4_count: int
+    predator_max_generation: int
 
     def __post_init__(self) -> None:
         for name in _U16_FIELDS:
@@ -127,7 +149,7 @@ def _validate_integer(name: str, value: int, maximum: int) -> None:
 
 
 def encode_frame(frame: FrameRecord) -> bytes:
-    """Encode one immutable record into an exact 32-byte protocol frame."""
+    """Encode one immutable record into an exact 48-byte protocol frame."""
 
     payload = _PAYLOAD.pack(
         frame.config_id,
@@ -145,6 +167,16 @@ def encode_frame(frame: FrameRecord) -> bytes:
         frame.speed_4_count,
         frame.max_generation,
         frame.state_checksum,
+        frame.predator_replacements,
+        frame.predator_starvations,
+        frame.predator_forager_turnovers,
+        frame.predator_energy_sum,
+        frame.predator_sense_sum,
+        frame.predator_speed_1_count,
+        frame.predator_speed_2_count,
+        frame.predator_speed_3_count,
+        frame.predator_speed_4_count,
+        frame.predator_max_generation,
     )
     packet_without_checksum = _HEADER.pack(
         MAGIC,
@@ -433,50 +465,9 @@ def verify_config_id(
 
 
 def load_experiment_config_id(path: str | Path) -> int:
-    """Load the unique ``config_id`` value from an experiment JSON document."""
+    """Recompute a configuration ID from a validated experiment document."""
 
-    document = json.loads(Path(path).read_text(encoding="utf-8"))
-    values = set(_find_config_ids(document))
-    if not values:
-        raise ValueError("experiment JSON does not contain config_id")
-    if len(values) != 1:
-        rendered = ", ".join(str(value) for value in sorted(values))
-        raise ValueError(
-            "experiment JSON contains conflicting config_id values: "
-            f"{rendered}"
-        )
-    return values.pop()
-
-
-def _find_config_ids(value: object) -> Iterable[int]:
-    if isinstance(value, Mapping):
-        for key, child in value.items():
-            if key == "config_id":
-                yield _coerce_config_id(child)
-            else:
-                yield from _find_config_ids(child)
-    elif isinstance(value, Sequence) and not isinstance(
-        value,
-        (str, bytes, bytearray),
-    ):
-        for child in value:
-            yield from _find_config_ids(child)
-
-
-def _coerce_config_id(value: object) -> int:
-    if isinstance(value, bool):
-        raise ValueError("config_id must be an integer or integer string")
-    if isinstance(value, int):
-        config_id = value
-    elif isinstance(value, str):
-        try:
-            config_id = int(value, 0)
-        except ValueError as exc:
-            raise ValueError(f"invalid config_id value: {value!r}") from exc
-    else:
-        raise ValueError("config_id must be an integer or integer string")
-    _validate_integer("config_id", config_id, 0xFFFF)
-    return config_id
+    return configuration_id(load_model_config(Path(path)))
 
 
 def summarize_frames(frames_to_summarize: Iterable[FrameRecord]) -> dict[str, object]:
@@ -493,7 +484,14 @@ def summarize_frames(frames_to_summarize: Iterable[FrameRecord]) -> dict[str, ob
         last.speed_3_count,
         last.speed_4_count,
     )
+    predator_speed_counts = (
+        last.predator_speed_1_count,
+        last.predator_speed_2_count,
+        last.predator_speed_3_count,
+        last.predator_speed_4_count,
+    )
     prey_count = sum(speed_counts)
+    predator_count = sum(predator_speed_counts)
     interval_deltas = {
         field: sum(
             (
@@ -506,6 +504,9 @@ def summarize_frames(frames_to_summarize: Iterable[FrameRecord]) -> dict[str, ob
             "forager_turnovers",
             "replacements",
             "starvations",
+            "predator_forager_turnovers",
+            "predator_replacements",
+            "predator_starvations",
         )
     }
     tick_steps = [
@@ -535,6 +536,35 @@ def summarize_frames(frames_to_summarize: Iterable[FrameRecord]) -> dict[str, ob
                 str(speed): count
                 for speed, count in enumerate(speed_counts, start=1)
             },
+            "predator_count": predator_count,
+            "predator_mean_energy": (
+                last.predator_energy_sum / predator_count
+                if predator_count
+                else None
+            ),
+            "predator_mean_sense": (
+                last.predator_sense_sum / predator_count
+                if predator_count
+                else None
+            ),
+            "predator_mean_speed": (
+                sum(
+                    speed * count
+                    for speed, count in enumerate(
+                        predator_speed_counts,
+                        start=1,
+                    )
+                ) / predator_count
+                if predator_count
+                else None
+            ),
+            "predator_speed_counts": {
+                str(speed): count
+                for speed, count in enumerate(
+                    predator_speed_counts,
+                    start=1,
+                )
+            },
         },
         "first_tick": records[0].tick,
         "forager_turnovers": last.forager_turnovers,
@@ -543,6 +573,19 @@ def summarize_frames(frames_to_summarize: Iterable[FrameRecord]) -> dict[str, ob
         "last_state_checksum": last.state_checksum,
         "last_tick": last.tick,
         "max_generation": max(frame.max_generation for frame in records),
+        "predator_forager_turnovers": last.predator_forager_turnovers,
+        "predator_max_generation": max(
+            frame.predator_max_generation for frame in records
+        ),
+        "predator_replacements": last.predator_replacements,
+        "predator_replacement_accounting_ok": (
+            last.predator_replacements
+            == (
+                last.predator_starvations
+                + last.predator_forager_turnovers
+            ) & 0xFFFF
+        ),
+        "predator_starvations": last.predator_starvations,
         "replacements": last.replacements,
         "replacement_accounting_ok": (
             last.replacements
