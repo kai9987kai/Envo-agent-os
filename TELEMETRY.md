@@ -220,7 +220,8 @@ claiming to implement the cited models:
 ## Limitations
 
 - Tick and cumulative event fields wrap at 65536; naive subtraction across the
-  boundary is wrong.
+  boundary is wrong. Per-agent generation words also wrap, so
+  `max_generation` is not a lifetime lineage-depth measure after wraparound.
 - The 16-bit `config_id` can collide. Equal prefixes are accepted by
   `--experiment`, so compare the full `config_sha256` and artifact provenance
   separately.

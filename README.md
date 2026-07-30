@@ -55,12 +55,12 @@ python create_iso.py [--output-dir DIR] [--config FILE] [--seed N]
 - `--output-dir DIR` keeps generated files together. The default is the
   repository directory containing `create_iso.py`.
 - `--seed N` selects the deterministic simulation seed. Reusing a seed with the
-  same model configuration is intended to reproduce the same initial world and
-  artifacts. Decimal and `0x`-prefixed hexadecimal values from 1 through 65535
-  are accepted; the default is `0xACE1`.
-- `--config FILE` rebuilds a complete experiment from a generated
-  `experiment.json`. `--seed` and `--telemetry-interval` can explicitly override
-  those two fields.
+  same source revision and model configuration is intended to reproduce the
+  same initial world and artifacts. Decimal and `0x`-prefixed hexadecimal values
+  from 1 through 65535 are accepted; the default is `0xACE1`.
+- `--config FILE` accepts a complete model-configuration object or rebuilds from
+  a generated `experiment.json`. `--seed` and `--telemetry-interval` can
+  explicitly override those two fields.
 - `--telemetry-interval N` emits one observation every N ticks. N must be a
   power of two from 1 through 32768; the default is 1. It changes the
   observation schedule and experiment identity, not the modeled trajectory.
